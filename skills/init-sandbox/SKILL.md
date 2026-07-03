@@ -53,7 +53,11 @@ CMD ["bash"]
 
 ### 2. `docker-compose.sandbox.yml`
 
-Replace PROJECT_NAME with the actual current directory name:
+First check whether the current directory is a **git worktree**: `.git` is a *file* (containing a `gitdir:` line) rather than a directory. This determines which template to use below.
+
+The resource limits (1.5G memory / 1.5 CPUs) are sized so several sandboxes can run in parallel on a small host without one runaway container taking down the machine. If the host is large and only one sandbox runs at a time, they can be raised.
+
+**Standard repository** (`.git` is a directory, or absent) — replace PROJECT_NAME with the actual current directory name:
 
 ```yaml
 services:
@@ -74,8 +78,40 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
-          cpus: '2'
+          memory: 1.5G
+          cpus: '1.5'
+```
+
+**Git worktree** (`.git` is a file) — a worktree's `.git` file and the main repository's `.git/worktrees/<name>/gitdir` link to each other by **absolute host path**, so mounting the worktree at `/workspace` would break every git command inside the container. Instead, mount both the worktree and the main repository at their identical absolute host paths.
+
+Derive the two paths first:
+- WORKTREE_PATH: absolute path of the current directory (`pwd`)
+- MAIN_REPO_PATH: the main repository root — run `git rev-parse --git-common-dir` and strip the trailing `/.git`
+
+Replace PROJECT_NAME, WORKTREE_PATH, and MAIN_REPO_PATH:
+
+```yaml
+services:
+  claude-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile.claude-sandbox
+    container_name: PROJECT_NAME-sandbox
+    volumes:
+      - WORKTREE_PATH:WORKTREE_PATH
+      - MAIN_REPO_PATH:MAIN_REPO_PATH
+      - ~/.claude:/home/claude/.claude
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - CLAUDE_CODE_SKIP_ONBOARDING=1
+    working_dir: WORKTREE_PATH
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+          cpus: '1.5'
 ```
 
 ### 3. `sandbox.sh`

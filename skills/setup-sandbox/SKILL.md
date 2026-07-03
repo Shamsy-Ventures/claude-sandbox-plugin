@@ -130,7 +130,7 @@ Edit `.claude/profiles/safe-mode.json` to add/remove allowed commands:
 
 ### Resource Limits
 
-Edit `docker-compose.sandbox.yml`:
+Defaults are 1.5G memory / 1.5 CPUs per container, sized so several sandboxes can run in parallel on a small host. Edit `docker-compose.sandbox.yml` to raise them:
 ```yaml
 deploy:
   resources:
@@ -138,6 +138,12 @@ deploy:
       memory: 8G  # Increase memory
       cpus: '4'   # More CPU cores
 ```
+
+## Git Worktrees
+
+A git worktree's `.git` is a file that points at the main repository's `.git/worktrees/<name>` by absolute host path (and the main repo links back the same way). Mounting only the worktree at `/workspace` breaks every git command inside the container.
+
+`/init-sandbox` detects this automatically: in a worktree it generates a compose file that mounts both the worktree and the main repository at their identical absolute host paths, and sets `working_dir` to the worktree path. Each worktree gets its own container (named after its directory), so a repo and several of its worktrees can run as parallel sandboxes.
 
 ## Environment Variables
 
