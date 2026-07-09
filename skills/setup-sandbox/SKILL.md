@@ -16,7 +16,7 @@ For most projects, just run `/init-sandbox` which will create all files automati
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile.claude-sandbox` | Docker image with Python, Node.js, Claude Code CLI |
+| `Dockerfile.claude-sandbox` | Docker image with Python, Node.js, Claude Code CLI, `gh`, and `git-lfs` |
 | `docker-compose.sandbox.yml` | Container orchestration with volume mounts |
 | `sandbox.sh` | Launch script with safe/full/shell/resume modes |
 | `.sandbox-state.json` | Container signature tracking (gitignored) |
@@ -61,6 +61,26 @@ For most projects, just run `/init-sandbox` which will create all files automati
 - If only one exists, auto-selects it
 - Starts the container if stopped, then runs `claude --resume` for interactive session picker
 - Falls back to scanning docker by project name if no state file exists
+
+## Session Carry-Over (Same-Path Mounting)
+
+Claude Code keys each session by the absolute working directory: `~/.claude/projects/<encoded-cwd>`. The repo is mounted **at its host absolute path** inside the container (not at `/workspace`), and `~/.claude` is shared with the host, so those keys are identical on the host, in every container, and across worktrees. A session started on the host is resumable in any sandbox, and vice versa.
+
+`sandbox.sh` computes the paths at launch and exports them for compose:
+- `SANDBOX_REPO_ROOT` — the main repo root (`git rev-parse --git-common-dir`), mounted at the same path
+- `SANDBOX_WORKDIR` — the launch directory (the worktree when launched from one), used as `working_dir`
+- `SANDBOX_CONTAINER_NAME` — `<project>-sandbox`
+
+The `:-` defaults in the compose file keep a plain `docker compose` invocation working at `/workspace` when the script isn't used.
+
+## GitHub CLI & git
+
+The image bundles `gh` and `git-lfs`. On every entry, `sandbox.sh` bootstraps the container (idempotent):
+- `gh auth setup-git` so git push/pull over HTTPS uses your gh credentials
+- `git lfs install`
+- copies the host's `git config user.name`/`user.email` into the container
+
+`gh` auth is shared with the host via the `~/.config/gh` mount, so `gh auth login` once — on the host or in any container — and every sandbox stays authenticated. Alternatively set `GH_TOKEN` in the environment. If `gh` is unauthenticated, the bootstrap prints a one-time hint.
 
 ## Auto-Update on Entry
 
@@ -141,9 +161,9 @@ deploy:
 
 ## Git Worktrees
 
-A git worktree's `.git` is a file that points at the main repository's `.git/worktrees/<name>` by absolute host path (and the main repo links back the same way). Mounting only the worktree at `/workspace` breaks every git command inside the container.
+A git worktree's `.git` is a file that points at the main repository's `.git/worktrees/<name>` by absolute host path (and the main repo links back the same way). The container must therefore see the main repo at that same path.
 
-`/init-sandbox` detects this automatically: in a worktree it generates a compose file that mounts both the worktree and the main repository at their identical absolute host paths, and sets `working_dir` to the worktree path. Each worktree gets its own container (named after its directory), so a repo and several of its worktrees can run as parallel sandboxes.
+Same-path mounting handles this with no separate template: when launched from a worktree, `sandbox.sh` resolves the main repo via `git rev-parse --git-common-dir`, mounts it at its host path (`SANDBOX_REPO_ROOT`), and sets `working_dir` to the worktree (`SANDBOX_WORKDIR`). A worktree created **inside** the repo tree (e.g. `git worktree add .claude/worktrees/feature`) is a subpath of that mount, so it — and its Claude session — carries over automatically. Each worktree gets its own container (named after its directory), so a repo and several of its worktrees can run as parallel sandboxes.
 
 ## Environment Variables
 

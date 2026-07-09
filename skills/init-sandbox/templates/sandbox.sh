@@ -16,6 +16,22 @@ STATE_FILE="${SCRIPT_DIR}/.sandbox-state.json"
 # Derive project name from directory
 PROJECT_NAME="$(basename "$SCRIPT_DIR")"
 
+# --- Same-path mounting: sessions carry over between host, sandbox, worktrees ---
+# Claude Code keys sessions by absolute cwd (~/.claude/projects/<encoded-cwd>).
+# Mounting the main repo at its host path inside the container makes those keys
+# identical everywhere, and ~/.claude is already shared — so a session started on
+# the host is resumable in any sandbox and vice versa. Worktrees created inside
+# the repo are subpaths of it, so they inherit this for free. When launched from
+# a worktree, mount the MAIN repo (the worktree's gitdir points into it) but
+# start Claude in the worktree.
+MAIN_REPO_ROOT="$(readlink -f "$(git -C "$SCRIPT_DIR" rev-parse --git-common-dir 2>/dev/null || echo "$SCRIPT_DIR/.git")/..")"
+export SANDBOX_REPO_ROOT="$MAIN_REPO_ROOT"
+export SANDBOX_WORKDIR="$SCRIPT_DIR"
+export SANDBOX_CONTAINER_NAME="${PROJECT_NAME}-sandbox"
+
+# Pre-create host dirs that compose mounts, so docker doesn't create them root-owned.
+mkdir -p "$HOME/.config/gh" "$HOME/.claude"
+
 # --- Helper: record container signature ---
 record_container() {
     local name="$1"
@@ -120,12 +136,36 @@ update_claude() {
 # --- Helper: apply permission profile ---
 apply_profile() {
     local mode="$1"
-    mkdir -p .claude/profiles
+    mkdir -p "$SCRIPT_DIR/.claude/profiles"
     if [ "$mode" = "full" ]; then
-        cp .claude/profiles/full-trust.json .claude/settings.local.json 2>/dev/null || true
+        cp "$SCRIPT_DIR/.claude/profiles/full-trust.json" "$SCRIPT_DIR/.claude/settings.local.json" 2>/dev/null || true
     else
-        cp .claude/profiles/safe-mode.json .claude/settings.local.json 2>/dev/null || true
+        cp "$SCRIPT_DIR/.claude/profiles/safe-mode.json" "$SCRIPT_DIR/.claude/settings.local.json" 2>/dev/null || true
     fi
+}
+
+# --- Helper: bootstrap gh + git inside the container (idempotent, runs on every entry) ---
+# gh auth comes from the mounted ~/.config/gh (or GH_TOKEN); wire it into git so
+# push/pull over https works, enable git-lfs, and carry the host's git identity in.
+bootstrap_container() {
+    local container="$1"
+    local git_name git_email
+    git_name="$(git config user.name 2>/dev/null || true)"
+    git_email="$(git config user.email 2>/dev/null || true)"
+    docker exec \
+        -e HOST_GIT_NAME="$git_name" \
+        -e HOST_GIT_EMAIL="$git_email" \
+        "$container" bash -c '
+        command -v gh >/dev/null 2>&1 && gh auth setup-git 2>/dev/null
+        command -v git-lfs >/dev/null 2>&1 && git lfs install --skip-repo 2>/dev/null
+        [ -n "$HOST_GIT_NAME" ]  && git config --global user.name  "$HOST_GIT_NAME"
+        [ -n "$HOST_GIT_EMAIL" ] && git config --global user.email "$HOST_GIT_EMAIL"
+        if command -v gh >/dev/null 2>&1 && ! gh auth status >/dev/null 2>&1; then
+            echo "NOTE: gh is installed but not authenticated. Run: gh auth login" >&2
+            echo "      (the token persists via the mounted ~/.config/gh, so this is one-time)" >&2
+        fi
+        true
+    ' 2>/dev/null || true
 }
 
 # --- Resume mode ---
@@ -144,6 +184,7 @@ if [ "$MODE" = "resume" ]; then
 
     ensure_running "$CONTAINER_NAME"
     update_claude "$CONTAINER_NAME"
+    bootstrap_container "$CONTAINER_NAME"
     docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
     exit 0
 fi
@@ -169,14 +210,16 @@ fi
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     ensure_running "$CONTAINER_NAME"
     update_claude "$CONTAINER_NAME"
+    bootstrap_container "$CONTAINER_NAME"
     echo "Attaching to container..."
     docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
 else
     # Container doesn't exist - create it detached, update Claude, then attach
     echo "Creating new container..."
-    docker compose -f docker-compose.sandbox.yml build
-    docker compose -f docker-compose.sandbox.yml up -d claude-sandbox
+    docker compose -f "$SCRIPT_DIR/docker-compose.sandbox.yml" build
+    docker compose -f "$SCRIPT_DIR/docker-compose.sandbox.yml" up -d claude-sandbox
     update_claude "$CONTAINER_NAME"
+    bootstrap_container "$CONTAINER_NAME"
 
     # Record the new container's signature
     record_container "$CONTAINER_NAME"

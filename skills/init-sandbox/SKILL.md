@@ -20,8 +20,17 @@ FROM python:3.11-slim
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
     git \
+    git-lfs \
     curl \
     jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI (auth comes from the mounted ~/.config/gh or GH_TOKEN)
+RUN mkdir -p -m 755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Claude Code)
@@ -53,11 +62,11 @@ CMD ["bash"]
 
 ### 2. `docker-compose.sandbox.yml`
 
-First check whether the current directory is a **git worktree**: `.git` is a *file* (containing a `gitdir:` line) rather than a directory. This determines which template to use below.
+A single template covers both standard repositories and git worktrees. It mounts the repo at its **host absolute path** (not `/workspace`) so Claude Code session keys — `~/.claude/projects/<encoded-cwd>` — are identical on the host, inside the container, and across worktrees; combined with the shared `~/.claude` mount, a session started anywhere is resumable everywhere. `sandbox.sh` computes the paths at launch (worktree-aware, via `git rev-parse --git-common-dir`) and exports `SANDBOX_REPO_ROOT` / `SANDBOX_WORKDIR` / `SANDBOX_CONTAINER_NAME`; the `:-` defaults keep a plain `docker compose` invocation working at `/workspace`.
 
 The resource limits (1.5G memory / 1.5 CPUs) are sized so several sandboxes can run in parallel on a small host without one runaway container taking down the machine. If the host is large and only one sandbox runs at a time, they can be raised.
 
-**Standard repository** (`.git` is a directory, or absent) — replace PROJECT_NAME with the actual current directory name:
+Replace PROJECT_NAME with the actual current directory name:
 
 ```yaml
 services:
@@ -65,14 +74,22 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.claude-sandbox
-    container_name: PROJECT_NAME-sandbox
+    container_name: ${SANDBOX_CONTAINER_NAME:-PROJECT_NAME-sandbox}
     volumes:
-      - .:/workspace
+      # Repo mounted at its HOST absolute path so Claude Code session keys match
+      # between host, container, and worktrees — a session started anywhere is
+      # resumable everywhere. sandbox.sh sets SANDBOX_REPO_ROOT; the default
+      # keeps plain `docker compose` invocations working at /workspace.
+      - ${SANDBOX_REPO_ROOT:-.}:${SANDBOX_REPO_ROOT:-/workspace}
       - ~/.claude:/home/claude/.claude
+      # gh auth (hosts.yml) shared with the host: `gh auth login` once — on the
+      # host or in any container — and every sandbox stays authenticated.
+      - ~/.config/gh:/home/claude/.config/gh
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - CLAUDE_CODE_SKIP_ONBOARDING=1
-    working_dir: /workspace
+      - GH_TOKEN=${GH_TOKEN:-}
+    working_dir: ${SANDBOX_WORKDIR:-/workspace}
     stdin_open: true
     tty: true
     deploy:
@@ -82,37 +99,7 @@ services:
           cpus: '1.5'
 ```
 
-**Git worktree** (`.git` is a file) — a worktree's `.git` file and the main repository's `.git/worktrees/<name>/gitdir` link to each other by **absolute host path**, so mounting the worktree at `/workspace` would break every git command inside the container. Instead, mount both the worktree and the main repository at their identical absolute host paths.
-
-Derive the two paths first:
-- WORKTREE_PATH: absolute path of the current directory (`pwd`)
-- MAIN_REPO_PATH: the main repository root — run `git rev-parse --git-common-dir` and strip the trailing `/.git`
-
-Replace PROJECT_NAME, WORKTREE_PATH, and MAIN_REPO_PATH:
-
-```yaml
-services:
-  claude-sandbox:
-    build:
-      context: .
-      dockerfile: Dockerfile.claude-sandbox
-    container_name: PROJECT_NAME-sandbox
-    volumes:
-      - WORKTREE_PATH:WORKTREE_PATH
-      - MAIN_REPO_PATH:MAIN_REPO_PATH
-      - ~/.claude:/home/claude/.claude
-    environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - CLAUDE_CODE_SKIP_ONBOARDING=1
-    working_dir: WORKTREE_PATH
-    stdin_open: true
-    tty: true
-    deploy:
-      resources:
-        limits:
-          memory: 1.5G
-          cpus: '1.5'
-```
+**Git worktrees.** A worktree's `.git` file and the main repository's `.git/worktrees/<name>/gitdir` link to each other by absolute host path, so the container must see the main repo at that same path. `sandbox.sh` resolves the main repo via `git rev-parse --git-common-dir` and mounts it (as `SANDBOX_REPO_ROOT`) while setting `working_dir` to the worktree (`SANDBOX_WORKDIR`). A worktree created **inside** the repo tree (e.g. `git worktree add .claude/worktrees/feature`) is a subpath of that mount, so it — and its session key — carries over automatically with no separate template.
 
 ### 3. `sandbox.sh`
 
@@ -147,6 +134,22 @@ STATE_FILE="@DOLLAR@{SCRIPT_DIR}/.sandbox-state.json"
 
 # Derive project name from directory
 PROJECT_NAME="@DOLLAR@(basename "@DOLLAR@SCRIPT_DIR")"
+
+# --- Same-path mounting: sessions carry over between host, sandbox, worktrees ---
+# Claude Code keys sessions by absolute cwd (~/.claude/projects/<encoded-cwd>).
+# Mounting the main repo at its host path inside the container makes those keys
+# identical everywhere, and ~/.claude is already shared — so a session started on
+# the host is resumable in any sandbox and vice versa. Worktrees created inside
+# the repo are subpaths of it, so they inherit this for free. When launched from
+# a worktree, mount the MAIN repo (the worktree's gitdir points into it) but
+# start Claude in the worktree.
+MAIN_REPO_ROOT="@DOLLAR@(readlink -f "@DOLLAR@(git -C "@DOLLAR@SCRIPT_DIR" rev-parse --git-common-dir 2>/dev/null || echo "@DOLLAR@SCRIPT_DIR/.git")/..")"
+export SANDBOX_REPO_ROOT="@DOLLAR@MAIN_REPO_ROOT"
+export SANDBOX_WORKDIR="@DOLLAR@SCRIPT_DIR"
+export SANDBOX_CONTAINER_NAME="@DOLLAR@{PROJECT_NAME}-sandbox"
+
+# Pre-create host dirs that compose mounts, so docker doesn't create them root-owned.
+mkdir -p "@DOLLAR@HOME/.config/gh" "@DOLLAR@HOME/.claude"
 
 # --- Helper: record container signature ---
 record_container() {
@@ -252,12 +255,36 @@ update_claude() {
 # --- Helper: apply permission profile ---
 apply_profile() {
     local mode="@DOLLAR@1"
-    mkdir -p .claude/profiles
+    mkdir -p "@DOLLAR@SCRIPT_DIR/.claude/profiles"
     if [ "@DOLLAR@mode" = "full" ]; then
-        cp .claude/profiles/full-trust.json .claude/settings.local.json 2>/dev/null || true
+        cp "@DOLLAR@SCRIPT_DIR/.claude/profiles/full-trust.json" "@DOLLAR@SCRIPT_DIR/.claude/settings.local.json" 2>/dev/null || true
     else
-        cp .claude/profiles/safe-mode.json .claude/settings.local.json 2>/dev/null || true
+        cp "@DOLLAR@SCRIPT_DIR/.claude/profiles/safe-mode.json" "@DOLLAR@SCRIPT_DIR/.claude/settings.local.json" 2>/dev/null || true
     fi
+}
+
+# --- Helper: bootstrap gh + git inside the container (idempotent, runs on every entry) ---
+# gh auth comes from the mounted ~/.config/gh (or GH_TOKEN); wire it into git so
+# push/pull over https works, enable git-lfs, and carry the host's git identity in.
+bootstrap_container() {
+    local container="@DOLLAR@1"
+    local git_name git_email
+    git_name="@DOLLAR@(git config user.name 2>/dev/null || true)"
+    git_email="@DOLLAR@(git config user.email 2>/dev/null || true)"
+    docker exec \
+        -e HOST_GIT_NAME="@DOLLAR@git_name" \
+        -e HOST_GIT_EMAIL="@DOLLAR@git_email" \
+        "@DOLLAR@container" bash -c '
+        command -v gh >/dev/null 2>&1 && gh auth setup-git 2>/dev/null
+        command -v git-lfs >/dev/null 2>&1 && git lfs install --skip-repo 2>/dev/null
+        [ -n "@DOLLAR@HOST_GIT_NAME" ]  && git config --global user.name  "@DOLLAR@HOST_GIT_NAME"
+        [ -n "@DOLLAR@HOST_GIT_EMAIL" ] && git config --global user.email "@DOLLAR@HOST_GIT_EMAIL"
+        if command -v gh >/dev/null 2>&1 && ! gh auth status >/dev/null 2>&1; then
+            echo "NOTE: gh is installed but not authenticated. Run: gh auth login" >&2
+            echo "      (the token persists via the mounted ~/.config/gh, so this is one-time)" >&2
+        fi
+        true
+    ' 2>/dev/null || true
 }
 
 # --- Resume mode ---
@@ -276,6 +303,7 @@ if [ "@DOLLAR@MODE" = "resume" ]; then
 
     ensure_running "@DOLLAR@CONTAINER_NAME"
     update_claude "@DOLLAR@CONTAINER_NAME"
+    bootstrap_container "@DOLLAR@CONTAINER_NAME"
     docker exec -it "@DOLLAR@CONTAINER_NAME" @DOLLAR@CLAUDE_CMD
     exit 0
 fi
@@ -301,14 +329,16 @@ fi
 if docker ps -a --format '{{.Names}}' | grep -q "^@DOLLAR@{CONTAINER_NAME}@DOLLAR@"; then
     ensure_running "@DOLLAR@CONTAINER_NAME"
     update_claude "@DOLLAR@CONTAINER_NAME"
+    bootstrap_container "@DOLLAR@CONTAINER_NAME"
     echo "Attaching to container..."
     docker exec -it "@DOLLAR@CONTAINER_NAME" @DOLLAR@CLAUDE_CMD
 else
     # Container doesn't exist - create it detached, update Claude, then attach
     echo "Creating new container..."
-    docker compose -f docker-compose.sandbox.yml build
-    docker compose -f docker-compose.sandbox.yml up -d claude-sandbox
+    docker compose -f "@DOLLAR@SCRIPT_DIR/docker-compose.sandbox.yml" build
+    docker compose -f "@DOLLAR@SCRIPT_DIR/docker-compose.sandbox.yml" up -d claude-sandbox
     update_claude "@DOLLAR@CONTAINER_NAME"
+    bootstrap_container "@DOLLAR@CONTAINER_NAME"
 
     # Record the new container's signature
     record_container "@DOLLAR@CONTAINER_NAME"
