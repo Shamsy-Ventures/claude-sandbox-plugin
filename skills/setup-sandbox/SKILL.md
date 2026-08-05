@@ -119,7 +119,7 @@ This file is gitignored (container IDs are machine-specific) but stays in the re
 
 Edit `Dockerfile.claude-sandbox` first line:
 - Python: `FROM python:3.11-slim`
-- Node: `FROM node:20-slim`
+- Node: `FROM node:22-slim`
 - Go: `FROM golang:1.21-bookworm`
 - Rust: `FROM rust:1.75-slim-bookworm`
 
@@ -163,7 +163,7 @@ deploy:
 
 A git worktree's `.git` is a file that points at the main repository's `.git/worktrees/<name>` by absolute host path (and the main repo links back the same way). The container must therefore see the main repo at that same path.
 
-Same-path mounting handles this with no separate template: when launched from a worktree, `sandbox.sh` resolves the main repo via `git rev-parse --git-common-dir`, mounts it at its host path (`SANDBOX_REPO_ROOT`), and sets `working_dir` to the worktree (`SANDBOX_WORKDIR`). A worktree created **inside** the repo tree (e.g. `git worktree add .claude/worktrees/feature`) is a subpath of that mount, so it — and its Claude session — carries over automatically. Each worktree gets its own container (named after its directory), so a repo and several of its worktrees can run as parallel sandboxes.
+Same-path mounting handles this with no separate template: when launched from a worktree, `sandbox.sh` resolves the main repo via `git rev-parse --git-common-dir`, mounts it at its host path (`SANDBOX_REPO_ROOT`), and sets `working_dir` to the worktree (`SANDBOX_WORKDIR`). A worktree created **inside** the repo tree (e.g. `git worktree add .claude/worktrees/feature`) is a subpath of that mount, so it — and its Claude session — carries over automatically. A worktree created **outside** the repo tree is mounted as well: on first launch `sandbox.sh` writes a gitignored `.sandbox-worktree.override.yml` compose override that adds the worktree's host path. Each worktree gets its own container (named after its directory), so a repo and several of its worktrees can run as parallel sandboxes.
 
 ## Environment Variables
 

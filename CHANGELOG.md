@@ -4,6 +4,24 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.4] - 2026-08-05
+
+### Fixed
+- Worktrees created **outside** the repo tree are now mounted. On first launch
+  `sandbox.sh` writes a gitignored `.sandbox-worktree.override.yml` compose
+  override that adds the worktree's host path, so git commands inside the
+  container resolve their gitdir correctly. Standard repos and inside-tree
+  worktrees are unaffected (they remain subpaths of the repo mount). This
+  removes the known limitation noted in 1.0.3.
+- Bumped the image to **Node.js 22** (from 20). Current Claude Code requires
+  Node >= 22; on Node 20 it installed with an `EBADENGINE` warning and was one
+  release from breaking. Surfaced by the end-to-end run below.
+
+### Verified
+- End-to-end: image builds with `gh` + `git-lfs`, the repo mounts at its host
+  absolute path with a matching `working_dir` (session-key parity), and the
+  container bootstrap wires up gh/git identity.
+
 ## [1.0.3] - 2026-07-09
 
 ### Added
@@ -54,6 +72,7 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
+[1.0.4]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.4
 [1.0.3]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.3
 [1.0.2]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.2
 [1.0.1]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.1

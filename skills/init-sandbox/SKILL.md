@@ -33,8 +33,8 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js (required for Claude Code)
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+# Install Node.js (Claude Code requires Node >= 22)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs
 
 # Install Claude Code CLI
@@ -99,7 +99,7 @@ services:
           cpus: '1.5'
 ```
 
-**Git worktrees.** A worktree's `.git` file and the main repository's `.git/worktrees/<name>/gitdir` link to each other by absolute host path, so the container must see the main repo at that same path. `sandbox.sh` resolves the main repo via `git rev-parse --git-common-dir` and mounts it (as `SANDBOX_REPO_ROOT`) while setting `working_dir` to the worktree (`SANDBOX_WORKDIR`). A worktree created **inside** the repo tree (e.g. `git worktree add .claude/worktrees/feature`) is a subpath of that mount, so it — and its session key — carries over automatically with no separate template.
+**Git worktrees.** A worktree's `.git` file and the main repository's `.git/worktrees/<name>/gitdir` link to each other by absolute host path, so the container must see the main repo at that same path. `sandbox.sh` resolves the main repo via `git rev-parse --git-common-dir` and mounts it (as `SANDBOX_REPO_ROOT`) while setting `working_dir` to the worktree (`SANDBOX_WORKDIR`). A worktree created **inside** the repo tree (e.g. `git worktree add .claude/worktrees/feature`) is a subpath of that mount, so it — and its session key — carries over automatically. A worktree created **outside** the repo tree is not covered by the repo mount, so on first launch `sandbox.sh` writes a `.sandbox-worktree.override.yml` compose override that additionally mounts the worktree at its host path. Either way, no separate template is needed.
 
 ### 3. `sandbox.sh`
 
@@ -335,8 +335,31 @@ if docker ps -a --format '{{.Names}}' | grep -q "^@DOLLAR@{CONTAINER_NAME}@DOLLA
 else
     # Container doesn't exist - create it detached, update Claude, then attach
     echo "Creating new container..."
-    docker compose -f "@DOLLAR@SCRIPT_DIR/docker-compose.sandbox.yml" build
-    docker compose -f "@DOLLAR@SCRIPT_DIR/docker-compose.sandbox.yml" up -d claude-sandbox
+
+    # The base compose mounts the main repo at its host path. A worktree created
+    # OUTSIDE that tree is not covered by that mount, so add a runtime override
+    # that also mounts the worktree at its host path. Standard repos and
+    # worktrees created INSIDE the repo tree are subpaths of the repo mount and
+    # need nothing extra.
+    COMPOSE_ARGS=(-f "@DOLLAR@SCRIPT_DIR/docker-compose.sandbox.yml")
+    OVERRIDE_FILE="@DOLLAR@SCRIPT_DIR/.sandbox-worktree.override.yml"
+    rm -f "@DOLLAR@OVERRIDE_FILE"
+    case "@DOLLAR@SANDBOX_WORKDIR/" in
+        "@DOLLAR@SANDBOX_REPO_ROOT/"*) : ;;
+        *)
+            cat > "@DOLLAR@OVERRIDE_FILE" <<YAML
+services:
+  claude-sandbox:
+    volumes:
+      - @DOLLAR@SANDBOX_WORKDIR:@DOLLAR@SANDBOX_WORKDIR
+YAML
+            COMPOSE_ARGS+=(-f "@DOLLAR@OVERRIDE_FILE")
+            echo "Worktree outside repo tree — added mount override for @DOLLAR@SANDBOX_WORKDIR"
+            ;;
+    esac
+
+    docker compose "@DOLLAR@{COMPOSE_ARGS[@]}" build
+    docker compose "@DOLLAR@{COMPOSE_ARGS[@]}" up -d claude-sandbox
     update_claude "@DOLLAR@CONTAINER_NAME"
     bootstrap_container "@DOLLAR@CONTAINER_NAME"
 
@@ -441,6 +464,7 @@ fi
 # Claude sandbox
 .claude/settings.local.json
 .sandbox-state.json
+.sandbox-worktree.override.yml
 .env
 ```
 

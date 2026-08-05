@@ -216,8 +216,31 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
 else
     # Container doesn't exist - create it detached, update Claude, then attach
     echo "Creating new container..."
-    docker compose -f "$SCRIPT_DIR/docker-compose.sandbox.yml" build
-    docker compose -f "$SCRIPT_DIR/docker-compose.sandbox.yml" up -d claude-sandbox
+
+    # The base compose mounts the main repo at its host path. A worktree created
+    # OUTSIDE that tree is not covered by that mount, so add a runtime override
+    # that also mounts the worktree at its host path. Standard repos and
+    # worktrees created INSIDE the repo tree are subpaths of the repo mount and
+    # need nothing extra.
+    COMPOSE_ARGS=(-f "$SCRIPT_DIR/docker-compose.sandbox.yml")
+    OVERRIDE_FILE="$SCRIPT_DIR/.sandbox-worktree.override.yml"
+    rm -f "$OVERRIDE_FILE"
+    case "$SANDBOX_WORKDIR/" in
+        "$SANDBOX_REPO_ROOT/"*) : ;;
+        *)
+            cat > "$OVERRIDE_FILE" <<YAML
+services:
+  claude-sandbox:
+    volumes:
+      - $SANDBOX_WORKDIR:$SANDBOX_WORKDIR
+YAML
+            COMPOSE_ARGS+=(-f "$OVERRIDE_FILE")
+            echo "Worktree outside repo tree — added mount override for $SANDBOX_WORKDIR"
+            ;;
+    esac
+
+    docker compose "${COMPOSE_ARGS[@]}" build
+    docker compose "${COMPOSE_ARGS[@]}" up -d claude-sandbox
     update_claude "$CONTAINER_NAME"
     bootstrap_container "$CONTAINER_NAME"
 
