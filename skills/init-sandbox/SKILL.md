@@ -394,10 +394,11 @@ fi
 
 ### 5. `.claude/profiles/full-trust.json`
 
+Full trust is delivered by the `--dangerously-skip-permissions` flag that `sandbox.sh` passes in every `full` / `resume` (full) launch — not by this file. The profile deliberately does **not** set `"defaultMode": "bypassPermissions"`: writing that string to disk trips Claude Code's auto-mode safety classifier, which blocks the file and leaves `/init-sandbox` incomplete in headless/auto sessions. Since the flag already bypasses the permission gate inside the container (the isolation boundary), the file only needs to carry the agent-teams env var and impose no restrictions.
+
 ```json
 {
   "permissions": {
-    "defaultMode": "bypassPermissions",
     "allow": [],
     "deny": []
   },

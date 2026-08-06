@@ -4,6 +4,18 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.5] - 2026-08-06
+
+### Fixed
+- `/init-sandbox` no longer stalls in auto/headless permission mode. The
+  `full-trust.json` profile previously contained `"defaultMode":
+  "bypassPermissions"`, which trips Claude Code's auto-mode safety classifier
+  and blocks the file write, leaving setup incomplete. Full trust is delivered
+  by the `--dangerously-skip-permissions` flag that `sandbox.sh` already passes
+  on every `full`/`resume` launch, so the redundant `defaultMode` line was
+  removed from the profile. Behavior is unchanged; the file now only carries the
+  agent-teams env var and no restrictions.
+
 ## [1.0.4] - 2026-08-05
 
 ### Fixed
@@ -72,6 +84,7 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
+[1.0.5]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.5
 [1.0.4]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.4
 [1.0.3]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.3
 [1.0.2]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.2
