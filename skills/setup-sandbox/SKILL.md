@@ -43,6 +43,26 @@ For most projects, just run `/init-sandbox` which will create all files automati
 - Runs with `--dangerously-skip-permissions`
 - Use only when you need unrestricted access
 
+### Attach-or-create picker (multiple sandboxes per project)
+
+When you run `full`/`safe`/`shell` in an interactive terminal **and at least one sandbox already exists** for the project, `sandbox.sh` shows a picker instead of silently attaching to the default container:
+
+```
+Sandboxes for myproject:
+  1) myproject-sandbox      [Up 3 hours]              running claude ~"Auth refactor" · main dev
+  2) myproject-exp          [Exited (0) 2 days ago]   idle · spike: new parser
+  n) Create a new sandbox
+
+Attach to [1-2] or 'n' for new:
+```
+
+Each row shows the container status, what's live inside it (`running claude` / `running codex` / `shell open` / `idle`), a **best-effort** guess of the current Claude session topic (the `~"..."` part — a repo-wide hint, not guaranteed to be that exact container's session), and the **description** you gave the container when you created it.
+
+- Pick a number → attach to that container (starting it if stopped).
+- Pick `n` → you're prompted for a **name** (defaults to the next free `<project>-sandbox-N`) and a short **description**, then a fresh container is created. Each new sandbox is its own compose project, so several can run in parallel against the same repo.
+
+The picker only appears once a container exists — the very first `./sandbox.sh full` in a project just creates the default `<project>-sandbox`. In non-interactive/CI contexts (no TTY) the picker is skipped entirely and the default container is used, so nothing hangs.
+
 ### Shell Mode
 ```bash
 ./sandbox.sh shell
@@ -69,7 +89,7 @@ Claude Code keys each session by the absolute working directory: `~/.claude/proj
 `sandbox.sh` computes the paths at launch and exports them for compose:
 - `SANDBOX_REPO_ROOT` — the main repo root (`git rev-parse --git-common-dir`), mounted at the same path
 - `SANDBOX_WORKDIR` — the launch directory (the worktree when launched from one), used as `working_dir`
-- `SANDBOX_CONTAINER_NAME` — `<project>-sandbox`
+- `SANDBOX_CONTAINER_NAME` — the target container name (default `<project>-sandbox`, or the name you choose when creating an additional sandbox)
 
 The `:-` defaults in the compose file keep a plain `docker compose` invocation working at `/workspace` when the script isn't used.
 
@@ -105,11 +125,14 @@ When you first create a container (`./sandbox.sh full` or `./sandbox.sh`), the s
       "name": "my-project-sandbox",
       "id": "a1b2c3d4e5f6",
       "image": "my-project-claude-sandbox",
-      "created_at": "2026-06-03T12:00:00Z"
+      "created_at": "2026-06-03T12:00:00Z",
+      "description": "main dev"
     }
   ]
 }
 ```
+
+The `description` is what you typed when the container was created; it's shown in the attach-or-create picker so you can tell your sandboxes apart.
 
 This file is gitignored (container IDs are machine-specific) but stays in the repo directory so you can quickly find your containers on resume.
 

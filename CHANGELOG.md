@@ -4,6 +4,28 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.6] - 2026-08-29
+
+### Added
+- **Attach-or-create picker.** Running `full`/`safe`/`shell` in an interactive
+  terminal, once at least one sandbox exists for the project, now shows a menu:
+  attach to an existing container or create a new, named one — instead of
+  silently attaching to the default. Each row shows the container status, what's
+  running inside (`claude`/`codex`/`shell`/`idle`), a best-effort guess of the
+  current Claude session topic, and the description you gave it.
+- **Named multiple sandboxes per repo.** Creating a new sandbox prompts for a
+  name (default `<project>-sandbox-N`) and a short description. Each container
+  runs as its own compose project (`-p`), so several sandboxes coexist against
+  the same repo. Descriptions are stored in `.sandbox-state.json`.
+
+### Notes
+- The picker is skipped when no container exists yet (first run stays instant)
+  and when non-interactive (CI/headless), preserving the previous default
+  single-container behavior.
+- Session-topic detection is best-effort and repo-wide: with multiple containers
+  in one repo it may show the wrong session's summary, so it's labeled a guess
+  (`~"..."`). The typed description is the reliable per-container label.
+
 ## [1.0.5] - 2026-08-06
 
 ### Fixed
@@ -84,6 +106,7 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
+[1.0.6]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.6
 [1.0.5]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.5
 [1.0.4]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.4
 [1.0.3]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.3

@@ -12,7 +12,8 @@ A Claude Code plugin that sets up Docker-based sandboxes with permission profile
 ## Features
 
 - **Permission profiles**: Safe mode (restricted) and full trust mode
-- **Container tracking**: Records container name/ID in `.sandbox-state.json` so you can find them later
+- **Container tracking**: Records container name/ID/description in `.sandbox-state.json` so you can find them later
+- **Attach-or-create picker**: When a sandbox already exists, choose whether to attach to it (with a description of what's running there) or create a new, named one — multiple sandboxes can run against one repo
 - **Session carry-over**: The repo is mounted at its host absolute path, so a Claude session started on the host, in any container, or in a worktree resumes anywhere
 - **Session resume**: Pick a container interactively, then pick a Claude session to resume
 - **GitHub CLI & git-lfs**: `gh` and `git-lfs` baked in; `gh` auth shared with the host and wired into git on every entry

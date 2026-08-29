@@ -7,6 +7,12 @@
 #   ./sandbox.sh shell        - Open container shell
 #   ./sandbox.sh resume       - Resume: pick container + session interactively (full trust)
 #   ./sandbox.sh resume safe  - Resume: pick container + session interactively (safe mode)
+#
+# When a sandbox already exists for this project and you run full/safe/shell in
+# an interactive terminal, you get a picker: attach to an existing container
+# (showing what's running there + its description) or create a new, named one.
+# With no existing container, or when non-interactive, it uses the default
+# <project>-sandbox container.
 
 MODE=${1:-"safe"}
 TRUST_MODE=${2:-"full"}
@@ -32,9 +38,10 @@ export SANDBOX_CONTAINER_NAME="${PROJECT_NAME}-sandbox"
 # Pre-create host dirs that compose mounts, so docker doesn't create them root-owned.
 mkdir -p "$HOME/.config/gh" "$HOME/.claude"
 
-# --- Helper: record container signature ---
+# --- Helper: record container signature (with optional user description) ---
 record_container() {
     local name="$1"
+    local description="$2"
     local id
     id=$(docker inspect --format '{{.Id}}' "$name" 2>/dev/null | head -c 12)
     local image
@@ -56,7 +63,8 @@ record_container() {
         --arg id "$id" \
         --arg image "$image" \
         --arg created "$created" \
-        '{name: $name, id: $id, image: $image, created_at: $created}')
+        --arg description "$description" \
+        '{name: $name, id: $id, image: $image, created_at: $created, description: $description}')
     entries=$(echo "$entries" | jq --argjson e "$new_entry" '. + [$e]')
 
     jq -n --argjson c "$entries" '{containers: $c}' > "$STATE_FILE"
@@ -168,6 +176,107 @@ bootstrap_container() {
     ' 2>/dev/null || true
 }
 
+# --- Helper: what interactive tool (if any) is running in a container ---
+# Inspects the container's process args. Echoes claude / codex / shell / "" .
+running_tool() {
+    local c="$1"
+    docker ps --format '{{.Names}}' | grep -q "^${c}$" || return 0   # not running
+    local args
+    args=$(docker top "$c" -eo args 2>/dev/null)
+    if echo "$args" | grep -qiE 'claude-code|@anthropic-ai/claude|(^|/| )claude( |$)'; then
+        echo "claude"
+    elif echo "$args" | grep -qiE '(^|/| )codex( |$)|codex'; then
+        echo "codex"
+    elif echo "$args" | grep -qE '(^|/)(ba)?sh( |$)'; then
+        echo "shell"
+    fi
+}
+
+# --- Helper: best-effort summary of the newest Claude session for this repo ---
+# Claude Code stores transcripts under ~/.claude/projects/<encoded-cwd>/*.jsonl.
+# The mapping is repo-wide (all containers in a repo share it), so this is shown
+# as a labeled guess, not a per-container fact.
+session_summary() {
+    local base="$HOME/.claude/projects"
+    [ -d "$base" ] || return 0
+    local dir="" e
+    for e in "$(printf '%s' "$SANDBOX_WORKDIR" | sed 's#/#-#g')" \
+             "$(printf '%s' "$SANDBOX_WORKDIR" | sed 's#[/.]#-#g')"; do
+        [ -d "$base/$e" ] && { dir="$base/$e"; break; }
+    done
+    [ -n "$dir" ] || return 0
+    local f
+    f=$(ls -t "$dir"/*.jsonl 2>/dev/null | head -1)
+    [ -n "$f" ] || return 0
+    local s
+    s=$(jq -rs '[.[] | select(.type=="summary") | .summary] | last // empty' "$f" 2>/dev/null)
+    if [ -z "$s" ]; then
+        s=$(jq -rs 'first(.[] | select(.type=="user") | .message.content
+                    | if type=="array" then (map(select(.type=="text").text) | join(" ")) else tostring end) // empty' \
+            "$f" 2>/dev/null)
+    fi
+    [ -n "$s" ] && printf '%s' "$s" | tr '\n' ' ' | cut -c1-60
+}
+
+# --- Helper: one-line description of what a container is/does ---
+describe_container() {
+    local c="$1" desc="$2" repo_summary="$3"
+    local tool out
+    tool=$(running_tool "$c")
+    case "$tool" in
+        claude) out="running claude"; [ -n "$repo_summary" ] && out="$out ~\"$repo_summary\"" ;;
+        codex)  out="running codex" ;;
+        shell)  out="shell open" ;;
+        *)      out="idle" ;;
+    esac
+    [ -n "$desc" ] && out="$out · $desc"
+    echo "$out"
+}
+
+# --- Helper: interactively attach to an existing sandbox or create a new one ---
+# Sets SELECTION to a container name, or "new" (user chose to create one), or
+# "none" (no existing containers for this project — caller creates the default).
+select_or_create() {
+    local names=() statuses=() descs=()
+    local seen=" " n st d
+    while IFS= read -r n; do
+        [ -z "$n" ] && continue
+        case "$seen" in *" $n "*) continue ;; esac
+        st=$(docker ps -a --filter "name=^${n}$" --format '{{.Status}}' 2>/dev/null)
+        [ -z "$st" ] && continue
+        seen="$seen$n "
+        d=""
+        [ -f "$STATE_FILE" ] && d=$(jq -r --arg n "$n" '.containers[]? | select(.name==$n) | .description // empty' "$STATE_FILE" 2>/dev/null)
+        names+=("$n"); statuses+=("$st"); descs+=("$d")
+    done < <( { [ -f "$STATE_FILE" ] && jq -r '.containers[]?.name' "$STATE_FILE" 2>/dev/null
+                docker ps -a --filter "name=${PROJECT_NAME}" --format '{{.Names}}' 2>/dev/null; } )
+
+    if [ ${#names[@]} -eq 0 ]; then
+        SELECTION="none"
+        return
+    fi
+
+    local repo_summary i info
+    repo_summary=$(session_summary)
+    echo "" >&2
+    echo "Sandboxes for ${PROJECT_NAME}:" >&2
+    for i in "${!names[@]}"; do
+        info=$(describe_container "${names[$i]}" "${descs[$i]}" "$repo_summary")
+        printf "  %d) %-26s [%s]  %s\n" "$((i+1))" "${names[$i]}" "${statuses[$i]}" "$info" >&2
+    done
+    echo "  n) Create a new sandbox" >&2
+    echo "" >&2
+    read -rp "Attach to [1-${#names[@]}] or 'n' for new: " choice
+    if [ "$choice" = "n" ] || [ "$choice" = "N" ]; then
+        SELECTION="new"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#names[@]} ]; then
+        SELECTION="${names[$((choice-1))]}"
+    else
+        echo "Invalid selection." >&2
+        exit 1
+    fi
+}
+
 # --- Resume mode ---
 if [ "$MODE" = "resume" ]; then
     CONTAINER_NAME=$(pick_container)
@@ -190,8 +299,6 @@ if [ "$MODE" = "resume" ]; then
 fi
 
 # --- Normal modes (full / safe / shell) ---
-CONTAINER_NAME="${PROJECT_NAME}-sandbox"
-
 if [ "$MODE" = "full" ]; then
     echo "WARNING: Running in full trust mode - all commands allowed"
     CLAUDE_CMD="claude --dangerously-skip-permissions"
@@ -206,16 +313,66 @@ else
     apply_profile "safe"
 fi
 
-# Check if container exists
-if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+# Choose target container. When at least one sandbox already exists for this
+# project and we have an interactive terminal, offer a picker: attach to an
+# existing one (with a description of what's running there) or create a new,
+# named one. With no existing containers, or when non-interactive (CI/headless),
+# fall back to the default single-container behavior so nothing hangs.
+CONTAINER_NAME="${PROJECT_NAME}-sandbox"
+CREATE_NEW=0
+NEW_DESC=""
+
+if [ -t 0 ]; then
+    select_or_create
+else
+    SELECTION="auto"
+fi
+
+if [ "$SELECTION" = "new" ]; then
+    # Suggest the next free default name, let the user override, and describe it.
+    suggest="${PROJECT_NAME}-sandbox"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${suggest}$"; then
+        k=2
+        while docker ps -a --format '{{.Names}}' | grep -q "^${PROJECT_NAME}-sandbox-${k}$"; do k=$((k+1)); done
+        suggest="${PROJECT_NAME}-sandbox-${k}"
+    fi
+    read -rp "Name for new sandbox [${suggest}]: " NEW_NAME
+    NEW_NAME="${NEW_NAME:-$suggest}"
+    if docker ps -a --format '{{.Names}}' | grep -q "^${NEW_NAME}$"; then
+        echo "A container named '$NEW_NAME' already exists — attach to it instead, or pick another name." >&2
+        exit 1
+    fi
+    read -rp "Short description (what's this sandbox for?): " NEW_DESC
+    CONTAINER_NAME="$NEW_NAME"
+    CREATE_NEW=1
+elif [ "$SELECTION" != "none" ] && [ "$SELECTION" != "auto" ]; then
+    # User picked an existing container from the menu.
+    CONTAINER_NAME="$SELECTION"
+    CREATE_NEW=0
+else
+    # none/auto: default name — attach if it exists, otherwise create it.
+    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        CREATE_NEW=0
+    else
+        CREATE_NEW=1
+    fi
+fi
+
+if [ "$CREATE_NEW" = "0" ]; then
     ensure_running "$CONTAINER_NAME"
     update_claude "$CONTAINER_NAME"
     bootstrap_container "$CONTAINER_NAME"
-    echo "Attaching to container..."
+    echo "Attaching to container: $CONTAINER_NAME"
     docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
 else
-    # Container doesn't exist - create it detached, update Claude, then attach
-    echo "Creating new container..."
+    # Create the container detached, update Claude, then attach.
+    echo "Creating new container: $CONTAINER_NAME"
+    export SANDBOX_CONTAINER_NAME="$CONTAINER_NAME"
+
+    # Each container is its own compose project so multiple sandboxes can
+    # coexist in one repo (compose otherwise treats the service as a singleton).
+    PROJ="$(printf '%s' "$CONTAINER_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^[^a-z0-9]*//')"
+    [ -z "$PROJ" ] && PROJ="sandbox"
 
     # The base compose mounts the main repo at its host path. A worktree created
     # OUTSIDE that tree is not covered by that mount, so add a runtime override
@@ -239,13 +396,13 @@ YAML
             ;;
     esac
 
-    docker compose "${COMPOSE_ARGS[@]}" build
-    docker compose "${COMPOSE_ARGS[@]}" up -d claude-sandbox
+    docker compose -p "$PROJ" "${COMPOSE_ARGS[@]}" build
+    docker compose -p "$PROJ" "${COMPOSE_ARGS[@]}" up -d claude-sandbox
     update_claude "$CONTAINER_NAME"
     bootstrap_container "$CONTAINER_NAME"
 
-    # Record the new container's signature
-    record_container "$CONTAINER_NAME"
+    # Record the new container's signature (with the user's description)
+    record_container "$CONTAINER_NAME" "$NEW_DESC"
 
     docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
 fi
