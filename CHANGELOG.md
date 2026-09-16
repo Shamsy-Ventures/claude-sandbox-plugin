@@ -4,6 +4,62 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.7] - 2026-09-16
+
+### Added
+- **Lifecycle commands.** `sandbox.sh` could only ever create or attach to a
+  container — nothing in the plugin stopped one, so sandboxes accumulated until
+  the host ran out of memory. Three commands close that loop:
+  - `./sandbox.sh ls [--all]` — sandboxes for this repo, or every sandbox on the
+    host, with what is running inside, the Claude session id and topic, and how
+    long that session has really been idle.
+  - `./sandbox.sh stop [--all]` — the same table, numbered, with multi-select
+    (`1 3 5`, `2-4`, `all`). Restates each selection with its session id and
+    topic and flags live Claude sessions before asking to confirm.
+  - `./sandbox.sh reap [--days N] [--dry-run] [--yes]` — host-wide, stops
+    sandboxes whose transcript has not been written in N days (default 7).
+    `--yes` makes it usable from a systemd timer; without a TTY and without
+    `--yes` it refuses rather than acting unattended.
+- **Recorded session ids.** New `full`/`safe` sessions are launched with an
+  explicit `--session-id` and the id is stored in `.sandbox-state.json`, so
+  `ls`/`stop` can name the session a container is running as a recorded fact
+  rather than inferring it from file timestamps.
+- **`./sandbox.sh upgrade [--all]`** — re-copies the canonical template from the
+  installed plugin, keeping a `sandbox.sh.bak-<oldversion>`.
+- **`templates/sync-sandboxes.sh`** — standalone propagation script that finds
+  every `sandbox.sh` under `$HOME` and refreshes the stale ones. It exists
+  separately from `upgrade` because `./sandbox.sh upgrade` only works on a copy
+  that already knows the verb; older copies fall through to their default mode
+  and *build a container* instead. It never touches a container, and reports
+  (without fixing) repos whose compose file still mounts at `/workspace`.
+
+### Fixed
+- **`running_tool()` never detected anything.** It called
+  `docker top <c> -eo args`, which Docker rejects with "Couldn't find PID field
+  in ps output" — the error was swallowed, so the function always returned
+  empty. Every row of the v1.0.6 attach-or-create picker therefore showed "idle"
+  no matter what was running inside. Now uses `-eo pid,args` and drops the pid.
+- **An unrecognised mode built a container.** Any argument that was not
+  `full`/`shell`/`resume` fell through to safe mode and created a sandbox — so a
+  typo, or a subcommand an older copy did not know (`./sandbox.sh upgrade` on a
+  1.0.0 script), silently did the opposite of what was asked. Unknown modes are
+  now a hard error listing the valid ones.
+- Session topics no longer render Claude's synthetic preambles
+  (`<local-command-caveat>`, slash-command echoes) as the summary.
+
+### Notes
+- Stopping a sandbox is non-destructive and always was: the repo and `~/.claude`
+  are bind-mounted from the host, so code and transcripts live outside the
+  container. This release documents that guarantee and builds the commands
+  around it.
+- Where several *live* sandboxes share one transcript directory — two sandboxes
+  on one repo, or several pre-1.0.3 containers all mounted at `/workspace` —
+  `ls` reports the session as `?shared` rather than naming one at random, and
+  uses container start time for the idle clock so a dormant sandbox cannot
+  inherit a sibling's freshness. Sessions started by 1.0.7+ are never ambiguous.
+- `SANDBOX_SH_VERSION` is now stamped in the script, so drift across repos can
+  be detected exactly instead of inferred from file length.
+
 ## [1.0.6] - 2026-08-29
 
 ### Added
@@ -106,6 +162,7 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
+[1.0.7]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.7
 [1.0.6]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.6
 [1.0.5]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.5
 [1.0.4]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.4

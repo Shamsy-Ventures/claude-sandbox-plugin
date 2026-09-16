@@ -114,6 +114,107 @@ It runs as root because the CLI lives in the root-owned npm global directory ins
 
 New containers are created detached (`docker compose up -d`), updated, and then attached — so even if the Docker image was built from a cached layer with an older CLI, the container gets the latest version before Claude first starts.
 
+## Lifecycle: ls / stop / reap
+
+Sandboxes used to only ever be created or attached to — nothing in the plugin
+stopped one. Containers therefore accumulated until the host ran out of memory.
+These three commands close that loop.
+
+**Stopping a sandbox is non-destructive.** The repo and `~/.claude` are
+bind-mounted from the host, so your code and every session transcript live
+*outside* the container. `docker start`, or any launch mode, resumes exactly
+where you left off. Only `docker rm` discards anything, and even then it is just
+the container layer (packages installed inside it, its shell history).
+
+### `./sandbox.sh ls [--all]`
+
+Lists this repo's sandboxes, or every sandbox on the host with `--all`:
+
+```
+  CONTAINER                    STATUS        TOOL    SESSION    TOPIC                     IDLE
+  hubtrack-sandbox             Up 2 months   claude  ?shared    -                         68d
+  hubtrack-sandbox-pr-reviews  Up 2 weeks    claude  ~6764e752  "What are the pr-review…"  5m
+  vanilla-agent-sandbox        Up 5 weeks    claude  399d7896   "go through the context…" 2m
+```
+
+- **TOOL** — what is actually running inside: `claude`, `codex`, `shell`, `-`.
+- **SESSION** — the Claude session id. Bare (`399d7896`) means sandbox.sh
+  launched it with an explicit `--session-id` and recorded it, so the mapping is
+  a fact. `~` means it was inferred from transcript timestamps. `?shared` means
+  several live sandboxes write to one transcript directory and the session
+  genuinely cannot be told apart — see below.
+- **TOPIC** — the newest rollup summary Claude wrote for that session, falling
+  back to the description you typed when creating the sandbox.
+- **IDLE** — time since that session's transcript was last written. This is the
+  real activity clock, not container uptime.
+
+### `./sandbox.sh stop [--all]`
+
+Shows the same table, numbered, and asks which to stop. Accepts `1 3 5`,
+`2-4`, `1,3`, `all`, or `q` to cancel. Before acting it restates each selection
+with its session id and topic, and flags any with a live Claude session:
+
+```
+Will stop:
+  - crypto-bot-sandbox   session 8a1f20c3  "Backtest the momentum strategy"   [LIVE claude — will be interrupted]
+
+Confirm stop? [y/N]:
+```
+
+A live session is safe to interrupt — the transcript is already on the host, so
+`./sandbox.sh resume` (or `claude --resume <id>`) picks it back up.
+
+### `./sandbox.sh reap [--days N] [--dry-run] [--yes]`
+
+Host-wide. Stops every running sandbox whose session transcript has not been
+written in `N` days (default 7). `--dry-run` reports without acting; `--yes`
+skips the prompt so it can run from a systemd timer or cron. Without a TTY and
+without `--yes` it refuses rather than stopping things unattended.
+
+### Why a session can be `?shared`
+
+Claude Code keys transcripts by absolute cwd. Two sandboxes end up sharing one
+transcript directory when they serve the same repo, or — for containers built
+from a pre-1.0.3 compose file — when they each mount their repo at `/workspace`,
+which collapses every such project into one `~/.claude/projects/-workspace`
+bucket. When more than one *live* container claims a directory, `ls` reports
+`?shared` instead of naming a session at random, and falls back to container
+start time for the idle clock so a dormant sandbox cannot inherit a sibling's
+freshness. Sessions started by v1.0.7+ record their id at launch and are never
+ambiguous, so this clears itself as you restart sandboxes.
+
+## Keeping sandbox.sh current across repos
+
+`sandbox.sh` is generated *into* each repo, so upgrading the plugin does not
+update repos created earlier — they keep running whatever version they were
+scaffolded with.
+
+**In one repo:** `./sandbox.sh upgrade` re-copies the canonical template from
+the installed plugin, keeping a `sandbox.sh.bak-<oldversion>`.
+
+**Across every repo:** run the plugin's standalone propagation script:
+
+```bash
+bash ~/.claude/plugins/cache/*/claude-sandbox/*/skills/init-sandbox/templates/sync-sandboxes.sh --dry-run
+bash ~/.claude/plugins/cache/*/claude-sandbox/*/skills/init-sandbox/templates/sync-sandboxes.sh
+```
+
+It finds every `sandbox.sh` under `$HOME`, reports its version, and refreshes
+the stale ones. It never touches a container.
+
+This is deliberately a separate script rather than only a `sandbox.sh`
+subcommand: `./sandbox.sh upgrade` only works if that copy already knows the
+verb. Older copies fall through to their default mode and **build a container**
+instead — the opposite of an upgrade. Propagation has to come from the plugin
+side. (v1.0.7 also makes an unrecognised mode a hard error, so that failure
+cannot recur from here on.)
+
+`sync-sandboxes.sh` additionally reports **compose drift** — repos whose
+`docker-compose.sandbox.yml` predates v1.0.3 and still mounts at `/workspace`.
+It will not fix those itself: the compose file must be regenerated with
+`/init-sandbox` and the container recreated, which changes the session key. Do
+that per repo when you next work in it.
+
 ## Container Tracking
 
 When you first create a container (`./sandbox.sh full` or `./sandbox.sh`), the script records its signature in `.sandbox-state.json`:

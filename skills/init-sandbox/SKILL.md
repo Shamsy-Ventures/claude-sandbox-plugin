@@ -118,20 +118,33 @@ The skill invocation message states the base directory (e.g. "Base directory for
 
 ```
 #!/bin/bash
-# Launch Claude Code in Docker sandbox
+# Launch and manage Claude Code Docker sandboxes
 #
-# Usage:
+# Session modes:
 #   ./sandbox.sh              - New session in safe mode
 #   ./sandbox.sh full         - New session in full trust mode
 #   ./sandbox.sh shell        - Open container shell
 #   ./sandbox.sh resume       - Resume: pick container + session interactively (full trust)
 #   ./sandbox.sh resume safe  - Resume: pick container + session interactively (safe mode)
 #
+# Lifecycle:
+#   ./sandbox.sh ls [--all]        - List sandboxes for this repo (--all: host-wide)
+#   ./sandbox.sh stop [--all]      - Pick sandboxes to stop (multi-select)
+#   ./sandbox.sh reap [--days N]   - Stop sandboxes idle past a threshold (host-wide)
+#   ./sandbox.sh upgrade [--all]   - Refresh sandbox.sh from the installed plugin
+#   ./sandbox.sh version           - Print this script's version
+#
+# Stopping a sandbox is non-destructive: the repo and ~/.claude are bind-mounted
+# from the host, so code and session transcripts live outside the container.
+# `docker start` (or any launch mode) picks up exactly where you left off.
+#
 # When a sandbox already exists for this project and you run full/safe/shell in
 # an interactive terminal, you get a picker: attach to an existing container
 # (showing what's running there + its description) or create a new, named one.
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
+
+SANDBOX_SH_VERSION="1.0.7"
 
 MODE=@DOLLAR@{1:-"safe"}
 TRUST_MODE=@DOLLAR@{2:-"full"}
@@ -156,6 +169,173 @@ export SANDBOX_CONTAINER_NAME="@DOLLAR@{PROJECT_NAME}-sandbox"
 
 # Pre-create host dirs that compose mounts, so docker doesn't create them root-owned.
 mkdir -p "@DOLLAR@HOME/.config/gh" "@DOLLAR@HOME/.claude"
+
+# =============================================================================
+# Session-transcript helpers
+#
+# Claude Code stores transcripts at ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
+# where <encoded-cwd> is the absolute cwd with "/" replaced by "-". Since
+# ~/.claude is bind-mounted into every sandbox, the host can read the transcript
+# of a session running inside a container directly.
+# =============================================================================
+
+# Resolve the transcript directory for a given absolute cwd. Tries both the
+# "/"-only encoding and the "/ and ." encoding used by older Claude versions.
+session_dir_for() {
+    local cwd="@DOLLAR@1" base="@DOLLAR@HOME/.claude/projects" e
+    [ -d "@DOLLAR@base" ] || return 1
+    for e in "@DOLLAR@(printf '%s' "@DOLLAR@cwd" | sed 's#/#-#g')" \
+             "@DOLLAR@(printf '%s' "@DOLLAR@cwd" | sed 's#[/.]#-#g')"; do
+        [ -d "@DOLLAR@base/@DOLLAR@e" ] && { printf '%s' "@DOLLAR@base/@DOLLAR@e"; return 0; }
+    done
+    return 1
+}
+
+# One-line topic for a transcript file: the newest rollup summary Claude wrote,
+# falling back to the opening user message.
+summary_of_file() {
+    local f="@DOLLAR@1" s
+    [ -f "@DOLLAR@f" ] || return 0
+    s=@DOLLAR@(jq -rs '[.[] | select(.type=="summary") | .summary] | last // empty' "@DOLLAR@f" 2>/dev/null)
+    if [ -z "@DOLLAR@s" ]; then
+        # No rollup summary yet — fall back to the first real user message,
+        # skipping the synthetic blocks Claude injects (slash-command echoes,
+        # caveat preambles, hook output) which otherwise read as gibberish.
+        s=@DOLLAR@(jq -rs 'first(.[] | select(.type=="user")
+                    | .message.content
+                    | if type=="array" then (map(select(.type=="text").text) | join(" ")) else tostring end
+                    | select(test("^<(local-command|command-name|command-message|system-reminder)") | not))
+                    // empty' "@DOLLAR@f" 2>/dev/null)
+    fi
+    [ -n "@DOLLAR@s" ] && printf '%s' "@DOLLAR@s" \
+        | sed -e 's/<[^>]*>//g' -e 's/^[[:space:]]*//' \
+        | tr '\n\t' '  ' | tr -s ' ' | cut -c1-58
+}
+
+# Host PID of the claude process running inside a container, if any.
+# `docker top` reports host PIDs, so /proc/<pid>/... is readable from here.
+container_claude_pid() {
+    docker top "@DOLLAR@1" -eo pid,args 2>/dev/null | tail -n +2 \
+        | awk '{pid=@DOLLAR@1; @DOLLAR@1=""; if (@DOLLAR@0 ~ /claude/ && @DOLLAR@0 !~ /npm (install|i) / && @DOLLAR@0 !~ /claude-code@/) {print pid; exit}}'
+}
+
+# The cwd a container's claude process is running in (its session key).
+container_cwd() {
+    local pid="@DOLLAR@1" c="@DOLLAR@2" d=""
+    [ -n "@DOLLAR@pid" ] && d=@DOLLAR@(readlink "/proc/@DOLLAR@pid/cwd" 2>/dev/null)
+    [ -z "@DOLLAR@d" ] && d=@DOLLAR@(docker inspect --format '{{.Config.WorkingDir}}' "@DOLLAR@c" 2>/dev/null)
+    printf '%s' "@DOLLAR@d"
+}
+
+# Host path of the repo bind-mounted into a container (excludes the shared
+# ~/.claude and ~/.config/gh mounts), used to locate that repo's state file.
+container_repo_dir() {
+    docker inspect --format \
+      '{{range .Mounts}}{{if eq .Type "bind"}}{{if and (ne .Destination "/home/claude/.claude") (ne .Destination "/home/claude/.config/gh")}}{{.Source}}
+{{end}}{{end}}{{end}}' "@DOLLAR@1" 2>/dev/null | grep -v '^@DOLLAR@' | head -1
+}
+
+# The session id sandbox.sh recorded for a container, if any (authoritative).
+recorded_session_id() {
+    local c="@DOLLAR@1" repo state
+    repo=@DOLLAR@(container_repo_dir "@DOLLAR@c")
+    state="@DOLLAR@{repo}/.sandbox-state.json"
+    [ -n "@DOLLAR@repo" ] && [ -f "@DOLLAR@state" ] || return 0
+    jq -r --arg n "@DOLLAR@c" '.containers[]? | select(.name==@DOLLAR@n) | .session_id // empty' "@DOLLAR@state" 2>/dev/null
+}
+
+# Resolve the Claude session running in a container.
+# Echoes: <session-id>\t<summary>\t<fact|guess|ambiguous|->
+#
+# Preferred path: sandbox.sh launched the session with an explicit --session-id
+# and recorded it in .sandbox-state.json, so the mapping is a fact.
+#
+# Fallback for containers started before v1.0.7: pick the most recently written
+# transcript in the container's session directory that has been touched since
+# the claude process started. That only identifies a session when this container
+# is the *sole* claimant of the directory. Containers that mount the repo at
+# /workspace (pre-1.0.3 compose) all share one directory, so several live
+# containers collide there — in that case report "ambiguous" rather than
+# confidently naming someone else's session.
+#
+# Args: <container> [claimant-count-for-its-session-dir]
+container_session() {
+    local c="@DOLLAR@1" claimants="@DOLLAR@{2:-1}"
+    local sid="" summ="" kind="-" pid cwd dir f pstart mtime
+
+    sid=@DOLLAR@(recorded_session_id "@DOLLAR@c")
+    pid=@DOLLAR@(container_claude_pid "@DOLLAR@c")
+    cwd=@DOLLAR@(container_cwd "@DOLLAR@pid" "@DOLLAR@c")
+    dir=@DOLLAR@(session_dir_for "@DOLLAR@cwd") || dir=""
+
+    if [ -n "@DOLLAR@sid" ] && [ -n "@DOLLAR@dir" ] && [ -f "@DOLLAR@dir/@DOLLAR@sid.jsonl" ]; then
+        kind="fact"
+        summ=@DOLLAR@(summary_of_file "@DOLLAR@dir/@DOLLAR@sid.jsonl")
+    elif [ -n "@DOLLAR@pid" ] && [ "@DOLLAR@claimants" -gt 1 ]; then
+        # Several live containers share this transcript directory; any pick
+        # would be a coin flip. Say so instead of guessing.
+        kind="ambiguous"
+    elif [ -n "@DOLLAR@pid" ] && [ -n "@DOLLAR@dir" ]; then
+        pstart=@DOLLAR@(ps -o lstart= -p "@DOLLAR@pid" 2>/dev/null)
+        pstart=@DOLLAR@([ -n "@DOLLAR@pstart" ] && date -d "@DOLLAR@pstart" +%s 2>/dev/null || echo 0)
+        for f in @DOLLAR@(ls -t "@DOLLAR@dir"/*.jsonl 2>/dev/null); do
+            mtime=@DOLLAR@(stat -c %Y "@DOLLAR@f" 2>/dev/null || echo 0)
+            if [ "@DOLLAR@mtime" -ge "@DOLLAR@pstart" ]; then
+                sid=@DOLLAR@(basename "@DOLLAR@f" .jsonl)
+                summ=@DOLLAR@(summary_of_file "@DOLLAR@f")
+                kind="guess"
+                break
+            fi
+        done
+    fi
+
+    printf '%s\x1f%s\x1f%s' "@DOLLAR@sid" "@DOLLAR@summ" "@DOLLAR@kind"
+}
+
+# Epoch of the last transcript write for a container (its real idle clock).
+#
+# Only meaningful when this container is the sole claimant of its transcript
+# directory: with a shared /workspace key, a sibling's activity would make a
+# months-dormant sandbox look busy. When the id is known (recorded) we can read
+# that one file exactly; when it is ambiguous we fall back to the container's
+# own start time, which never over-reports freshness.
+#
+# Args: <container> [claimant-count-for-its-session-dir]
+last_activity_epoch() {
+    local c="@DOLLAR@1" claimants="@DOLLAR@{2:-1}" pid cwd dir f ts=0 s sid
+    sid=@DOLLAR@(recorded_session_id "@DOLLAR@c")
+    pid=@DOLLAR@(container_claude_pid "@DOLLAR@c")
+    cwd=@DOLLAR@(container_cwd "@DOLLAR@pid" "@DOLLAR@c")
+    dir=@DOLLAR@(session_dir_for "@DOLLAR@cwd") || dir=""
+
+    if [ -n "@DOLLAR@dir" ] && [ -n "@DOLLAR@sid" ] && [ -f "@DOLLAR@dir/@DOLLAR@sid.jsonl" ]; then
+        ts=@DOLLAR@(stat -c %Y "@DOLLAR@dir/@DOLLAR@sid.jsonl" 2>/dev/null || echo 0)
+    elif [ -n "@DOLLAR@dir" ] && [ "@DOLLAR@claimants" -le 1 ]; then
+        f=@DOLLAR@(ls -t "@DOLLAR@dir"/*.jsonl 2>/dev/null | head -1)
+        [ -n "@DOLLAR@f" ] && ts=@DOLLAR@(stat -c %Y "@DOLLAR@f" 2>/dev/null || echo 0)
+    fi
+
+    if [ "@DOLLAR@ts" = "0" ]; then
+        s=@DOLLAR@(docker inspect --format '{{.State.StartedAt}}' "@DOLLAR@c" 2>/dev/null)
+        ts=@DOLLAR@(date -d "@DOLLAR@s" +%s 2>/dev/null || echo 0)
+    fi
+    echo "@DOLLAR@ts"
+}
+
+# Human-readable age from an epoch, e.g. "3d", "5h", "12m".
+age_short() {
+    local then="@DOLLAR@1" now secs
+    now=@DOLLAR@(date +%s)
+    [ -z "@DOLLAR@then" ] || [ "@DOLLAR@then" = "0" ] && { echo "?"; return; }
+    secs=@DOLLAR@(( now - then ))
+    if   [ "@DOLLAR@secs" -ge 86400 ]; then echo "@DOLLAR@(( secs / 86400 ))d"
+    elif [ "@DOLLAR@secs" -ge 3600 ];  then echo "@DOLLAR@(( secs / 3600 ))h"
+    else echo "@DOLLAR@(( secs / 60 ))m"; fi
+}
+
+# =============================================================================
+# Container helpers
+# =============================================================================
 
 # --- Helper: record container signature (with optional user description) ---
 record_container() {
@@ -188,6 +368,34 @@ record_container() {
 
     jq -n --argjson c "@DOLLAR@entries" '{containers: @DOLLAR@c}' > "@DOLLAR@STATE_FILE"
     echo "Container recorded in .sandbox-state.json"
+}
+
+# --- Helper: record which Claude session a container is running ---
+# Makes `ls`/`stop` able to report the session id as a fact rather than a guess.
+record_session() {
+    local name="@DOLLAR@1" sid="@DOLLAR@2"
+    [ -n "@DOLLAR@sid" ] || return 0
+    local entries="[]"
+    [ -f "@DOLLAR@STATE_FILE" ] && entries=@DOLLAR@(jq '.containers // []' "@DOLLAR@STATE_FILE" 2>/dev/null || echo "[]")
+    # Ensure an entry exists for this container, then stamp the session onto it.
+    if [ "@DOLLAR@(echo "@DOLLAR@entries" | jq --arg n "@DOLLAR@name" '[.[] | select(.name==@DOLLAR@n)] | length')" = "0" ]; then
+        entries=@DOLLAR@(echo "@DOLLAR@entries" | jq --arg n "@DOLLAR@name" '. + [{name: @DOLLAR@n, description: ""}]')
+    fi
+    entries=@DOLLAR@(echo "@DOLLAR@entries" | jq \
+        --arg n "@DOLLAR@name" --arg s "@DOLLAR@sid" --arg t "@DOLLAR@(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        '[.[] | if .name == @DOLLAR@n then . + {session_id: @DOLLAR@s, session_started_at: @DOLLAR@t} else . end]')
+    jq -n --argjson c "@DOLLAR@entries" '{containers: @DOLLAR@c}' > "@DOLLAR@STATE_FILE"
+}
+
+# --- Helper: generate a session UUID ---
+new_uuid() {
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        cat /proc/sys/kernel/random/uuid
+    elif command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+    else
+        python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null
+    fi
 }
 
 # --- Helper: pick a container interactively ---
@@ -301,7 +509,9 @@ running_tool() {
     local c="@DOLLAR@1"
     docker ps --format '{{.Names}}' | grep -q "^@DOLLAR@{c}@DOLLAR@" || return 0   # not running
     local args
-    args=@DOLLAR@(docker top "@DOLLAR@c" -eo args 2>/dev/null)
+    # `docker top` rejects a format without a PID column ("Couldn't find PID
+    # field in ps output"), so ask for pid,args and drop the pid.
+    args=@DOLLAR@(docker top "@DOLLAR@c" -eo pid,args 2>/dev/null | tail -n +2 | cut -d' ' -f2-)
     if echo "@DOLLAR@args" | grep -qiE 'claude-code|@anthropic-ai/claude|(^|/| )claude( |@DOLLAR@)'; then
         echo "claude"
     elif echo "@DOLLAR@args" | grep -qiE '(^|/| )codex( |@DOLLAR@)|codex'; then
@@ -312,29 +522,12 @@ running_tool() {
 }
 
 # --- Helper: best-effort summary of the newest Claude session for this repo ---
-# Claude Code stores transcripts under ~/.claude/projects/<encoded-cwd>/*.jsonl.
-# The mapping is repo-wide (all containers in a repo share it), so this is shown
-# as a labeled guess, not a per-container fact.
+# Used only by the attach-or-create picker, where a repo-wide hint is enough.
 session_summary() {
-    local base="@DOLLAR@HOME/.claude/projects"
-    [ -d "@DOLLAR@base" ] || return 0
-    local dir="" e
-    for e in "@DOLLAR@(printf '%s' "@DOLLAR@SANDBOX_WORKDIR" | sed 's#/#-#g')" \
-             "@DOLLAR@(printf '%s' "@DOLLAR@SANDBOX_WORKDIR" | sed 's#[/.]#-#g')"; do
-        [ -d "@DOLLAR@base/@DOLLAR@e" ] && { dir="@DOLLAR@base/@DOLLAR@e"; break; }
-    done
-    [ -n "@DOLLAR@dir" ] || return 0
-    local f
+    local dir f
+    dir=@DOLLAR@(session_dir_for "@DOLLAR@SANDBOX_WORKDIR") || return 0
     f=@DOLLAR@(ls -t "@DOLLAR@dir"/*.jsonl 2>/dev/null | head -1)
-    [ -n "@DOLLAR@f" ] || return 0
-    local s
-    s=@DOLLAR@(jq -rs '[.[] | select(.type=="summary") | .summary] | last // empty' "@DOLLAR@f" 2>/dev/null)
-    if [ -z "@DOLLAR@s" ]; then
-        s=@DOLLAR@(jq -rs 'first(.[] | select(.type=="user") | .message.content
-                    | if type=="array" then (map(select(.type=="text").text) | join(" ")) else tostring end) // empty' \
-            "@DOLLAR@f" 2>/dev/null)
-    fi
-    [ -n "@DOLLAR@s" ] && printf '%s' "@DOLLAR@s" | tr '\n' ' ' | cut -c1-60
+    [ -n "@DOLLAR@f" ] && summary_of_file "@DOLLAR@f"
 }
 
 # --- Helper: one-line description of what a container is/does ---
@@ -396,6 +589,416 @@ select_or_create() {
     fi
 }
 
+# =============================================================================
+# Lifecycle subcommands: ls / stop / reap / upgrade
+# =============================================================================
+
+# Enumerate sandbox containers. Scope "repo" (default) uses this project's state
+# file plus name match; scope "all" finds every sandbox container on the host.
+enumerate_sandboxes() {
+    local scope="@DOLLAR@{1:-repo}"
+    if [ "@DOLLAR@scope" = "all" ]; then
+        # A sandbox is any container whose image or name marks it as one.
+        { docker ps -a --filter "name=sandbox" --format '{{.Names}}' 2>/dev/null
+          docker ps -a --filter "ancestor=claude-sandbox" --format '{{.Names}}' 2>/dev/null
+        } | sort -u
+    else
+        { [ -f "@DOLLAR@STATE_FILE" ] && jq -r '.containers[]?.name' "@DOLLAR@STATE_FILE" 2>/dev/null
+          docker ps -a --filter "name=@DOLLAR@{PROJECT_NAME}" --format '{{.Names}}' 2>/dev/null
+        } | sort -u
+    fi
+}
+
+# How many *live* containers without a recorded session id share each transcript
+# directory? Any container in a directory claimed by more than one of those has
+# an unidentifiable session — and an unusable idle clock, since a sibling's
+# writes would make a dormant sandbox look busy. Populates CLAIMS_BY_NAME.
+# Args: <container names...>
+build_claims() {
+    local -A by_dir=()
+    local n pid cwd dir
+    declare -gA CLAIMS_BY_NAME=()
+    local -A dir_of=()
+    for n in "@DOLLAR@@"; do
+        [ -z "@DOLLAR@n" ] && continue
+        pid=@DOLLAR@(container_claude_pid "@DOLLAR@n")
+        if [ -n "@DOLLAR@pid" ] && [ -z "@DOLLAR@(recorded_session_id "@DOLLAR@n")" ]; then
+            cwd=@DOLLAR@(container_cwd "@DOLLAR@pid" "@DOLLAR@n")
+            dir=@DOLLAR@(session_dir_for "@DOLLAR@cwd") || dir=""
+            if [ -n "@DOLLAR@dir" ]; then
+                by_dir["@DOLLAR@dir"]=@DOLLAR@(( @DOLLAR@{by_dir["@DOLLAR@dir"]:-0} + 1 ))
+                dir_of["@DOLLAR@n"]="@DOLLAR@dir"
+            fi
+        fi
+    done
+    for n in "@DOLLAR@@"; do
+        [ -z "@DOLLAR@n" ] && continue
+        dir="@DOLLAR@{dir_of[@DOLLAR@n]:-}"
+        if [ -n "@DOLLAR@dir" ]; then CLAIMS_BY_NAME["@DOLLAR@n"]="@DOLLAR@{by_dir["@DOLLAR@dir"]:-1}"
+        else CLAIMS_BY_NAME["@DOLLAR@n"]=1; fi
+    done
+}
+
+# Render the shared sandbox table. Populates the parallel arrays ROW_NAMES /
+# ROW_STATUS so callers (ls, stop) can act on the same numbering the user sees.
+# Args: scope [--number]
+render_table() {
+    local scope="@DOLLAR@1" numbered="@DOLLAR@2"
+    ROW_NAMES=(); ROW_STATUS=(); ROW_CLAIMANTS=()
+    local n st tool sid summ kind idle repo desc line i=0
+
+    while IFS= read -r n; do
+        [ -z "@DOLLAR@n" ] && continue
+        st=@DOLLAR@(docker ps -a --filter "name=^@DOLLAR@{n}@DOLLAR@" --format '{{.Status}}' 2>/dev/null)
+        [ -z "@DOLLAR@st" ] && continue
+        ROW_NAMES+=("@DOLLAR@n"); ROW_STATUS+=("@DOLLAR@st")
+    done < <(enumerate_sandboxes "@DOLLAR@scope")
+
+    if [ @DOLLAR@{#ROW_NAMES[@]} -eq 0 ]; then
+        echo "No sandboxes found." >&2
+        return 1
+    fi
+
+    # Pass 1: work out which containers share a transcript directory, so pass 2
+    # can tell an identified session from an unidentifiable one.
+    build_claims "@DOLLAR@{ROW_NAMES[@]}"
+    for i in "@DOLLAR@{!ROW_NAMES[@]}"; do
+        ROW_CLAIMANTS+=("@DOLLAR@{CLAIMS_BY_NAME[@DOLLAR@{ROW_NAMES[@DOLLAR@i]}]:-1}")
+    done
+
+    printf "\n"
+    if [ "@DOLLAR@numbered" = "--number" ]; then
+        printf "  %-3s %-34s %-16s %-7s %-9s %-40s %s\n" "#" "CONTAINER" "STATUS" "TOOL" "SESSION" "TOPIC" "IDLE"
+        printf "  %-3s %-34s %-16s %-7s %-9s %-40s %s\n" "---" "@DOLLAR@(printf '%.0s-' {1..34})" "@DOLLAR@(printf '%.0s-' {1..16})" "-------" "---------" "@DOLLAR@(printf '%.0s-' {1..40})" "----"
+    else
+        printf "  %-34s %-16s %-7s %-9s %-40s %s\n" "CONTAINER" "STATUS" "TOOL" "SESSION" "TOPIC" "IDLE"
+        printf "  %-34s %-16s %-7s %-9s %-40s %s\n" "@DOLLAR@(printf '%.0s-' {1..34})" "@DOLLAR@(printf '%.0s-' {1..16})" "-------" "---------" "@DOLLAR@(printf '%.0s-' {1..40})" "----"
+    fi
+
+    local ambiguous=0
+    for i in "@DOLLAR@{!ROW_NAMES[@]}"; do
+        n="@DOLLAR@{ROW_NAMES[@DOLLAR@i]}"; st="@DOLLAR@{ROW_STATUS[@DOLLAR@i]}"
+        tool=@DOLLAR@(running_tool "@DOLLAR@n"); [ -z "@DOLLAR@tool" ] && tool="-"
+        IFS=@DOLLAR@'\x1f' read -r sid summ kind <<< "@DOLLAR@(container_session "@DOLLAR@n" "@DOLLAR@{ROW_CLAIMANTS[@DOLLAR@i]}")"
+        idle=@DOLLAR@(age_short "@DOLLAR@(last_activity_epoch "@DOLLAR@n" "@DOLLAR@{ROW_CLAIMANTS[@DOLLAR@i]}")")
+        repo=@DOLLAR@(container_repo_dir "@DOLLAR@n")
+        desc=""
+        [ -n "@DOLLAR@repo" ] && [ -f "@DOLLAR@repo/.sandbox-state.json" ] && \
+            desc=@DOLLAR@(jq -r --arg n "@DOLLAR@n" '.containers[]? | select(.name==@DOLLAR@n) | .description // empty' "@DOLLAR@repo/.sandbox-state.json" 2>/dev/null)
+
+        # Short session id: bare when recorded, ~ when inferred, ? when several
+        # live containers share one transcript directory and it cannot be told.
+        local sid_disp="-"
+        if [ "@DOLLAR@kind" = "ambiguous" ]; then
+            sid_disp="?shared"
+            ambiguous=1
+        elif [ -n "@DOLLAR@sid" ]; then
+            sid_disp="@DOLLAR@{sid:0:8}"
+            [ "@DOLLAR@kind" = "guess" ] && sid_disp="~@DOLLAR@{sid:0:8}"
+        fi
+        # Prefer the live session topic; fall back to the typed description.
+        local topic="@DOLLAR@{summ:-@DOLLAR@desc}"
+        [ -n "@DOLLAR@topic" ] && topic="\"@DOLLAR@{topic}\""
+        [ -z "@DOLLAR@topic" ] && topic="-"
+
+        if [ "@DOLLAR@numbered" = "--number" ]; then
+            printf "  %-3s %-34s %-16s %-7s %-9s %-40s %s\n" \
+                "@DOLLAR@((i+1))" "@DOLLAR@n" "@DOLLAR@{st:0:16}" "@DOLLAR@tool" "@DOLLAR@sid_disp" "@DOLLAR@{topic:0:40}" "@DOLLAR@idle"
+        else
+            printf "  %-34s %-16s %-7s %-9s %-40s %s\n" \
+                "@DOLLAR@n" "@DOLLAR@{st:0:16}" "@DOLLAR@tool" "@DOLLAR@sid_disp" "@DOLLAR@{topic:0:40}" "@DOLLAR@idle"
+        fi
+    done
+    printf "\n"
+    printf "  SESSION: Claude session id — bare = recorded at launch, ~ = inferred\n"
+    printf "  IDLE   : time since this session's transcript was last written\n"
+    if [ "@DOLLAR@ambiguous" = "1" ]; then
+        printf "\n"
+        printf "  ?shared — several live sandboxes write to one transcript directory, so\n"
+        printf "            their sessions cannot be told apart. This happens when two\n"
+        printf "            sandboxes serve the same repo, and across unrelated repos when\n"
+        printf "            they mount at /workspace (pre-1.0.3 compose). Sessions started\n"
+        printf "            by v1.0.7+ record their id at launch and are never ambiguous,\n"
+        printf "            so this clears itself as you restart these sandboxes.\n"
+    fi
+    printf "\n"
+    return 0
+}
+
+# Expand a selection string ("1 3 5", "2-4", "1,3", "all") into row numbers.
+parse_selection() {
+    local input="@DOLLAR@1" max="@DOLLAR@2" out=() tok a b i
+    input=@DOLLAR@(echo "@DOLLAR@input" | tr ',' ' ')
+    for tok in @DOLLAR@input; do
+        case "@DOLLAR@tok" in
+            all|ALL|a|A)
+                for ((i=1; i<=max; i++)); do out+=("@DOLLAR@i"); done ;;
+            *-*)
+                a=@DOLLAR@{tok%%-*}; b=@DOLLAR@{tok##*-}
+                [[ "@DOLLAR@a" =~ ^[0-9]+@DOLLAR@ && "@DOLLAR@b" =~ ^[0-9]+@DOLLAR@ ]] || return 1
+                for ((i=a; i<=b; i++)); do out+=("@DOLLAR@i"); done ;;
+            *)
+                [[ "@DOLLAR@tok" =~ ^[0-9]+@DOLLAR@ ]] || return 1
+                out+=("@DOLLAR@tok") ;;
+        esac
+    done
+    [ @DOLLAR@{#out[@]} -eq 0 ] && return 1
+    printf '%s\n' "@DOLLAR@{out[@]}" | sort -un | awk -v m="@DOLLAR@max" '@DOLLAR@1>=1 && @DOLLAR@1<=m'
+}
+
+cmd_ls() {
+    local scope="repo"
+    [ "@DOLLAR@1" = "--all" ] && scope="all"
+    render_table "@DOLLAR@scope" ""
+}
+
+cmd_stop() {
+    local scope="repo"
+    [ "@DOLLAR@1" = "--all" ] && scope="all"
+
+    if ! [ -t 0 ]; then
+        echo "Error: 'stop' is interactive and needs a terminal. Use 'reap --yes' for automation." >&2
+        exit 1
+    fi
+
+    render_table "@DOLLAR@scope" "--number" || exit 1
+
+    echo "Stopping is non-destructive: code and ~/.claude transcripts are on the host,"
+    echo "so a stopped sandbox restarts exactly where it left off."
+    echo ""
+    read -rp "Stop which sandboxes? [e.g. 1 3 5 | 2-4 | all | q to cancel]: " choice
+    case "@DOLLAR@choice" in
+        q|Q|"") echo "Cancelled."; exit 0 ;;
+    esac
+
+    local picks
+    picks=@DOLLAR@(parse_selection "@DOLLAR@choice" "@DOLLAR@{#ROW_NAMES[@]}") || { echo "Invalid selection." >&2; exit 1; }
+    [ -z "@DOLLAR@picks" ] && { echo "Nothing selected."; exit 0; }
+
+    echo ""
+    echo "Will stop:"
+    local n tool sid summ kind live=0
+    while IFS= read -r i; do
+        n="@DOLLAR@{ROW_NAMES[@DOLLAR@((i-1))]}"
+        tool=@DOLLAR@(running_tool "@DOLLAR@n")
+        # Same claimant count the table used, so the confirmation cannot name a
+        # session the table just reported as unidentifiable.
+        IFS=@DOLLAR@'\x1f' read -r sid summ kind <<< "@DOLLAR@(container_session "@DOLLAR@n" "@DOLLAR@{ROW_CLAIMANTS[@DOLLAR@((i-1))]}")"
+        printf "  - %s" "@DOLLAR@n"
+        if [ "@DOLLAR@kind" = "ambiguous" ]; then
+            printf "  session ?shared (cannot be identified)"
+        else
+            [ -n "@DOLLAR@sid" ] && printf "  session %s" "@DOLLAR@{sid:0:8}"
+            [ -n "@DOLLAR@summ" ] && printf "  \"%s\"" "@DOLLAR@summ"
+        fi
+        if [ "@DOLLAR@tool" = "claude" ]; then printf "   [LIVE claude — will be interrupted]"; live=1; fi
+        printf "\n"
+    done <<< "@DOLLAR@picks"
+    echo ""
+    if [ "@DOLLAR@live" = "1" ]; then
+        echo "One or more have a live Claude session. The transcript is already on the host,"
+        echo "so you can pick it back up with:  ./sandbox.sh resume   (or  claude --resume <id>)"
+        echo ""
+    fi
+
+    read -rp "Confirm stop? [y/N]: " ok
+    case "@DOLLAR@ok" in
+        y|Y|yes|YES) ;;
+        *) echo "Cancelled."; exit 0 ;;
+    esac
+
+    while IFS= read -r i; do
+        n="@DOLLAR@{ROW_NAMES[@DOLLAR@((i-1))]}"
+        if docker ps --format '{{.Names}}' | grep -q "^@DOLLAR@{n}@DOLLAR@"; then
+            docker stop "@DOLLAR@n" >/dev/null && echo "  stopped  @DOLLAR@n"
+        else
+            echo "  already stopped  @DOLLAR@n"
+        fi
+    done <<< "@DOLLAR@picks"
+    echo ""
+    echo "Restart any of them with: docker start <name>  — or just ./sandbox.sh in that repo."
+}
+
+cmd_reap() {
+    local days=7 dry=0 assume_yes=0
+    while [ @DOLLAR@# -gt 0 ]; do
+        case "@DOLLAR@1" in
+            --days) days="@DOLLAR@2"; shift 2 ;;
+            --days=*) days="@DOLLAR@{1#*=}"; shift ;;
+            --dry-run|-n) dry=1; shift ;;
+            --yes|-y) assume_yes=1; shift ;;
+            *) echo "Unknown option for reap: @DOLLAR@1" >&2; exit 1 ;;
+        esac
+    done
+    [[ "@DOLLAR@days" =~ ^[0-9]+@DOLLAR@ ]] || { echo "--days needs a number" >&2; exit 1; }
+
+    local cutoff now n st last idle_days tool targets=() running=()
+    now=@DOLLAR@(date +%s)
+    cutoff=@DOLLAR@(( now - days * 86400 ))
+
+    while IFS= read -r n; do
+        [ -z "@DOLLAR@n" ] && continue
+        docker ps --format '{{.Names}}' | grep -q "^@DOLLAR@{n}@DOLLAR@" || continue   # already stopped
+        running+=("@DOLLAR@n")
+    done < <(enumerate_sandboxes "all")
+    [ @DOLLAR@{#running[@]} -eq 0 ] && { echo "No running sandboxes."; exit 0; }
+
+    # Claimant counts matter here: without them a dormant sandbox sharing a
+    # transcript directory inherits a sibling's fresh mtime and never gets reaped.
+    build_claims "@DOLLAR@{running[@]}"
+
+    for n in "@DOLLAR@{running[@]}"; do
+        last=@DOLLAR@(last_activity_epoch "@DOLLAR@n" "@DOLLAR@{CLAIMS_BY_NAME[@DOLLAR@n]:-1}")
+        [ "@DOLLAR@last" = "0" ] && continue
+        [ "@DOLLAR@last" -lt "@DOLLAR@cutoff" ] && targets+=("@DOLLAR@n")
+    done
+
+    if [ @DOLLAR@{#targets[@]} -eq 0 ]; then
+        echo "Nothing to reap: no running sandbox has been idle longer than @DOLLAR@{days}d."
+        exit 0
+    fi
+
+    echo ""
+    echo "Idle longer than @DOLLAR@{days}d:"
+    local sid summ kind cl
+    for n in "@DOLLAR@{targets[@]}"; do
+        cl="@DOLLAR@{CLAIMS_BY_NAME[@DOLLAR@n]:-1}"
+        tool=@DOLLAR@(running_tool "@DOLLAR@n"); [ -z "@DOLLAR@tool" ] && tool="idle"
+        IFS=@DOLLAR@'\x1f' read -r sid summ kind <<< "@DOLLAR@(container_session "@DOLLAR@n" "@DOLLAR@cl")"
+        [ "@DOLLAR@kind" = "ambiguous" ] && sid="?shared"
+        printf "  %-34s  %-7s  %-9s  idle %-5s %s\n" \
+            "@DOLLAR@n" "@DOLLAR@tool" "@DOLLAR@{sid:0:8}" "@DOLLAR@(age_short "@DOLLAR@(last_activity_epoch "@DOLLAR@n" "@DOLLAR@cl")")" "@DOLLAR@{summ:+\"@DOLLAR@summ\"}"
+    done
+    echo ""
+
+    if [ "@DOLLAR@dry" = "1" ]; then
+        echo "(dry run — nothing stopped)"
+        exit 0
+    fi
+
+    if [ "@DOLLAR@assume_yes" != "1" ]; then
+        if ! [ -t 0 ]; then
+            echo "Refusing to stop without confirmation in a non-interactive shell. Pass --yes." >&2
+            exit 1
+        fi
+        read -rp "Stop these @DOLLAR@{#targets[@]} sandbox(es)? [y/N]: " ok
+        case "@DOLLAR@ok" in y|Y|yes|YES) ;; *) echo "Cancelled."; exit 0 ;; esac
+    fi
+
+    for n in "@DOLLAR@{targets[@]}"; do
+        docker stop "@DOLLAR@n" >/dev/null && echo "  stopped  @DOLLAR@n"
+    done
+}
+
+# Locate the installed plugin so `upgrade` can re-copy the canonical template.
+find_plugin_dir() {
+    local c
+    if [ -n "@DOLLAR@CLAUDE_SANDBOX_PLUGIN_DIR" ] && [ -f "@DOLLAR@CLAUDE_SANDBOX_PLUGIN_DIR/skills/init-sandbox/templates/sandbox.sh" ]; then
+        printf '%s' "@DOLLAR@CLAUDE_SANDBOX_PLUGIN_DIR"; return 0
+    fi
+    # Highest installed version in the plugin cache wins.
+    c=@DOLLAR@(ls -d "@DOLLAR@HOME"/.claude/plugins/cache/*/claude-sandbox/*/ 2>/dev/null | sort -V | tail -1)
+    [ -n "@DOLLAR@c" ] && [ -f "@DOLLAR@{c}skills/init-sandbox/templates/sandbox.sh" ] && { printf '%s' "@DOLLAR@{c%/}"; return 0; }
+    for c in "@DOLLAR@HOME"/.claude/plugins/marketplaces/*claude-sandbox*/ "@DOLLAR@HOME"/Projects/claude-sandbox-plugin/; do
+        [ -f "@DOLLAR@{c}skills/init-sandbox/templates/sandbox.sh" ] && { printf '%s' "@DOLLAR@{c%/}"; return 0; }
+    done
+    return 1
+}
+
+# Version stamp of a sandbox.sh on disk ("1.0.0" if it predates the stamp).
+sh_version_of() {
+    local f="@DOLLAR@1" v
+    v=@DOLLAR@(grep -m1 '^SANDBOX_SH_VERSION=' "@DOLLAR@f" 2>/dev/null | cut -d'"' -f2)
+    printf '%s' "@DOLLAR@{v:-1.0.0}"
+}
+
+# Refresh one repo's sandbox.sh from the plugin. Echoes a status word.
+upgrade_one() {
+    local repo="@DOLLAR@1" src="@DOLLAR@2" force="@DOLLAR@3"
+    local dst="@DOLLAR@repo/sandbox.sh" cur new
+    [ -f "@DOLLAR@dst" ] || { echo "skip"; return; }
+    cur=@DOLLAR@(sh_version_of "@DOLLAR@dst")
+    new=@DOLLAR@(sh_version_of "@DOLLAR@src")
+    if [ "@DOLLAR@cur" = "@DOLLAR@new" ] && [ "@DOLLAR@force" != "--force" ]; then echo "current"; return; fi
+    cp "@DOLLAR@dst" "@DOLLAR@dst.bak-@DOLLAR@cur" 2>/dev/null
+    cp "@DOLLAR@src" "@DOLLAR@dst" && chmod +x "@DOLLAR@dst" && echo "upgraded @DOLLAR@cur -> @DOLLAR@new"
+}
+
+# Report repos whose generated compose still mounts the repo at /workspace.
+# Fixing that needs the container recreated, which this script will not do
+# silently — it changes the session key, so it is surfaced, not automated.
+check_compose_drift() {
+    local repo="@DOLLAR@1" f="@DOLLAR@repo/docker-compose.sandbox.yml"
+    [ -f "@DOLLAR@f" ] || return 1
+    grep -q 'SANDBOX_REPO_ROOT' "@DOLLAR@f" 2>/dev/null && return 1
+    return 0
+}
+
+cmd_upgrade() {
+    local all=0 force=""
+    while [ @DOLLAR@# -gt 0 ]; do
+        case "@DOLLAR@1" in
+            --all) all=1; shift ;;
+            --force) force="--force"; shift ;;
+            *) echo "Unknown option for upgrade: @DOLLAR@1" >&2; exit 1 ;;
+        esac
+    done
+
+    local plugin src
+    plugin=@DOLLAR@(find_plugin_dir) || {
+        echo "Error: could not locate the claude-sandbox plugin." >&2
+        echo "Set CLAUDE_SANDBOX_PLUGIN_DIR to the plugin root and retry." >&2
+        exit 1
+    }
+    src="@DOLLAR@plugin/skills/init-sandbox/templates/sandbox.sh"
+    echo "Plugin template: @DOLLAR@src  (v@DOLLAR@(sh_version_of "@DOLLAR@src"))"
+    echo ""
+
+    local repos=() drift=()
+    if [ "@DOLLAR@all" = "1" ]; then
+        mapfile -t repos < <(find "@DOLLAR@HOME" -maxdepth 4 -name sandbox.sh -not -path "*/node_modules/*" \
+            -not -path "@DOLLAR@plugin/*" -printf '%h\n' 2>/dev/null | sort -u)
+    else
+        repos=("@DOLLAR@SCRIPT_DIR")
+    fi
+
+    local r res
+    for r in "@DOLLAR@{repos[@]}"; do
+        res=@DOLLAR@(upgrade_one "@DOLLAR@r" "@DOLLAR@src" "@DOLLAR@force")
+        printf "  %-50s %s\n" "@DOLLAR@{r/#@DOLLAR@HOME/~}" "@DOLLAR@res"
+        check_compose_drift "@DOLLAR@r" && drift+=("@DOLLAR@r")
+    done
+
+    if [ @DOLLAR@{#drift[@]} -gt 0 ]; then
+        echo ""
+        echo "These repos still generate a /workspace mount (pre-1.0.3 compose file)."
+        echo "sandbox.sh is now current, but the session key only becomes shared once"
+        echo "the compose file is regenerated AND the container recreated:"
+        for r in "@DOLLAR@{drift[@]}"; do echo "    @DOLLAR@{r/#@DOLLAR@HOME/~}"; done
+        echo ""
+        echo "  In each:  /init-sandbox     then   docker rm -f <name> && ./sandbox.sh full"
+        echo "  (the container layer is discarded; code and transcripts are on the host)"
+    fi
+}
+
+# --- Subcommand dispatch (before the session modes) ---
+case "@DOLLAR@MODE" in
+    ls|list)   shift; cmd_ls "@DOLLAR@@"; exit @DOLLAR@? ;;
+    stop)      shift; cmd_stop "@DOLLAR@@"; exit @DOLLAR@? ;;
+    reap)      shift; cmd_reap "@DOLLAR@@"; exit @DOLLAR@? ;;
+    upgrade)   shift; cmd_upgrade "@DOLLAR@@"; exit @DOLLAR@? ;;
+    version|--version|-v) echo "sandbox.sh @DOLLAR@SANDBOX_SH_VERSION"; exit 0 ;;
+    help|--help|-h) sed -n '2,30p' "@DOLLAR@0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    safe|full|shell|resume) ;;
+    *)
+        # Anything else is a typo or a subcommand this copy is too old to know.
+        # Earlier versions fell through to safe mode here and *built a container*
+        # — so an unrecognised verb silently did the opposite of what was asked.
+        echo "Unknown mode: '@DOLLAR@MODE'" >&2
+        echo "Modes: safe | full | shell | resume | ls | stop | reap | upgrade | version | help" >&2
+        exit 2 ;;
+esac
+
 # --- Resume mode ---
 if [ "@DOLLAR@MODE" = "resume" ]; then
     CONTAINER_NAME=@DOLLAR@(pick_container)
@@ -418,9 +1021,14 @@ if [ "@DOLLAR@MODE" = "resume" ]; then
 fi
 
 # --- Normal modes (full / safe / shell) ---
+# New sessions get an explicit --session-id so `ls`/`stop` can report which
+# session a container is running as a recorded fact rather than an inference.
+NEW_SESSION_ID=""
 if [ "@DOLLAR@MODE" = "full" ]; then
     echo "WARNING: Running in full trust mode - all commands allowed"
+    NEW_SESSION_ID=@DOLLAR@(new_uuid)
     CLAUDE_CMD="claude --dangerously-skip-permissions"
+    [ -n "@DOLLAR@NEW_SESSION_ID" ] && CLAUDE_CMD="@DOLLAR@CLAUDE_CMD --session-id @DOLLAR@NEW_SESSION_ID"
     apply_profile "full"
 elif [ "@DOLLAR@MODE" = "shell" ]; then
     echo "Opening container shell (run 'claude' to start Claude Code)"
@@ -428,7 +1036,9 @@ elif [ "@DOLLAR@MODE" = "shell" ]; then
     apply_profile "safe"
 else
     echo "Running in safe mode with restricted permissions"
+    NEW_SESSION_ID=@DOLLAR@(new_uuid)
     CLAUDE_CMD="claude"
+    [ -n "@DOLLAR@NEW_SESSION_ID" ] && CLAUDE_CMD="@DOLLAR@CLAUDE_CMD --session-id @DOLLAR@NEW_SESSION_ID"
     apply_profile "safe"
 fi
 
@@ -481,6 +1091,7 @@ if [ "@DOLLAR@CREATE_NEW" = "0" ]; then
     ensure_running "@DOLLAR@CONTAINER_NAME"
     update_claude "@DOLLAR@CONTAINER_NAME"
     bootstrap_container "@DOLLAR@CONTAINER_NAME"
+    record_session "@DOLLAR@CONTAINER_NAME" "@DOLLAR@NEW_SESSION_ID"
     echo "Attaching to container: @DOLLAR@CONTAINER_NAME"
     docker exec -it "@DOLLAR@CONTAINER_NAME" @DOLLAR@CLAUDE_CMD
 else
@@ -522,6 +1133,7 @@ YAML
 
     # Record the new container's signature (with the user's description)
     record_container "@DOLLAR@CONTAINER_NAME" "@DOLLAR@NEW_DESC"
+    record_session "@DOLLAR@CONTAINER_NAME" "@DOLLAR@NEW_SESSION_ID"
 
     docker exec -it "@DOLLAR@CONTAINER_NAME" @DOLLAR@CLAUDE_CMD
 fi
@@ -650,7 +1262,15 @@ To start:
      ./sandbox.sh shell  (bash shell)
      ./sandbox.sh resume [full|safe]  (resume container + session)
 
+Lifecycle:
+  ./sandbox.sh ls [--all]       list sandboxes + the session each is running
+  ./sandbox.sh stop [--all]     pick sandboxes to stop (multi-select)
+  ./sandbox.sh reap --days N    stop sandboxes idle past a threshold
+  ./sandbox.sh upgrade          refresh this script from the plugin
+
 Container tracking:
   - .sandbox-state.json records container name/ID after first run
+  - new sessions record their --session-id, so ls/stop can name the
+    session a container is running instead of guessing
   - ./sandbox.sh resume reads this file to find your containers
 ```
