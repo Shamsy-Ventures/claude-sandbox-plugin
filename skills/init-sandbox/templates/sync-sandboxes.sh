@@ -65,6 +65,11 @@ version_of() {
     printf '%s' "${v:-1.0.0}"
 }
 
+version_lt() {
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
+}
+
 NEW_VER=$(version_of "$SRC")
 SRC_REAL=$(readlink -f "$SRC")
 
@@ -108,6 +113,13 @@ for repo in "${REPOS[@]}"; do
     if [ "$cur" = "$NEW_VER" ] && [ -z "$FORCE" ]; then
         current=$((current+1))
         [ "$QUIET" = "1" ] || printf "  %-52s current (v%s)\n" "$short" "$cur"
+        continue
+    fi
+
+    # Never walk a repo backwards (see sandbox.sh upgrade_one).
+    if version_lt "$NEW_VER" "$cur" && [ -z "$FORCE" ]; then
+        skipped=$((skipped+1))
+        printf "  %-52s REFUSED: template v%s is older than repo v%s\n" "$short" "$NEW_VER" "$cur" >&2
         continue
     fi
 

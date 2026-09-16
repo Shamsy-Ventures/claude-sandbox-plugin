@@ -4,6 +4,17 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.8] - 2026-09-16
+
+### Fixed
+- **`upgrade` / `sync-sandboxes.sh` could silently downgrade a repo.** Both
+  compared the template and repo versions only for equality, so when the plugin
+  copy was *older* than the repo's script it overwrote it anyway. That is the
+  normal state right after a release: the tag is pushed but the plugin cache
+  still holds the previous version, so running `./sandbox.sh upgrade` would
+  revert a freshly propagated repo. Both now refuse to move a repo backwards
+  and say so; `--force` still overrides.
+
 ## [1.0.7] - 2026-09-16
 
 ### Added
@@ -162,6 +173,7 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
+[1.0.8]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.8
 [1.0.7]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.7
 [1.0.6]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.6
 [1.0.5]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.5

@@ -25,7 +25,7 @@
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
 
-SANDBOX_SH_VERSION="1.0.7"
+SANDBOX_SH_VERSION="1.0.8"
 
 MODE=${1:-"safe"}
 TRUST_MODE=${2:-"full"}
@@ -786,6 +786,12 @@ find_plugin_dir() {
     return 1
 }
 
+# True when $1 is a strictly older version than $2.
+version_lt() {
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]
+}
+
 # Version stamp of a sandbox.sh on disk ("1.0.0" if it predates the stamp).
 sh_version_of() {
     local f="$1" v
@@ -801,6 +807,13 @@ upgrade_one() {
     cur=$(sh_version_of "$dst")
     new=$(sh_version_of "$src")
     if [ "$cur" = "$new" ] && [ "$force" != "--force" ]; then echo "current"; return; fi
+    # Never walk a repo backwards. The plugin cache can legitimately be older
+    # than a repo (a release pushed but not yet installed), and copying it over
+    # would silently revert the repo to the older script.
+    if version_lt "$new" "$cur" && [ "$force" != "--force" ]; then
+        echo "refused: plugin has v$new, repo already has v$cur (use --force to override)"
+        return
+    fi
     cp "$dst" "$dst.bak-$cur" 2>/dev/null
     cp "$src" "$dst" && chmod +x "$dst" && echo "upgraded $cur -> $new"
 }

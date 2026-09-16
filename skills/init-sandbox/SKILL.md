@@ -144,7 +144,7 @@ The skill invocation message states the base directory (e.g. "Base directory for
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
 
-SANDBOX_SH_VERSION="1.0.7"
+SANDBOX_SH_VERSION="1.0.8"
 
 MODE=@DOLLAR@{1:-"safe"}
 TRUST_MODE=@DOLLAR@{2:-"full"}
@@ -905,6 +905,12 @@ find_plugin_dir() {
     return 1
 }
 
+# True when @DOLLAR@1 is a strictly older version than @DOLLAR@2.
+version_lt() {
+    [ "@DOLLAR@1" = "@DOLLAR@2" ] && return 1
+    [ "@DOLLAR@(printf '%s\n%s\n' "@DOLLAR@1" "@DOLLAR@2" | sort -V | head -1)" = "@DOLLAR@1" ]
+}
+
 # Version stamp of a sandbox.sh on disk ("1.0.0" if it predates the stamp).
 sh_version_of() {
     local f="@DOLLAR@1" v
@@ -920,6 +926,13 @@ upgrade_one() {
     cur=@DOLLAR@(sh_version_of "@DOLLAR@dst")
     new=@DOLLAR@(sh_version_of "@DOLLAR@src")
     if [ "@DOLLAR@cur" = "@DOLLAR@new" ] && [ "@DOLLAR@force" != "--force" ]; then echo "current"; return; fi
+    # Never walk a repo backwards. The plugin cache can legitimately be older
+    # than a repo (a release pushed but not yet installed), and copying it over
+    # would silently revert the repo to the older script.
+    if version_lt "@DOLLAR@new" "@DOLLAR@cur" && [ "@DOLLAR@force" != "--force" ]; then
+        echo "refused: plugin has v@DOLLAR@new, repo already has v@DOLLAR@cur (use --force to override)"
+        return
+    fi
     cp "@DOLLAR@dst" "@DOLLAR@dst.bak-@DOLLAR@cur" 2>/dev/null
     cp "@DOLLAR@src" "@DOLLAR@dst" && chmod +x "@DOLLAR@dst" && echo "upgraded @DOLLAR@cur -> @DOLLAR@new"
 }
