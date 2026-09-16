@@ -187,13 +187,13 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
-[1.0.9]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.9
-[1.0.8]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.8
-[1.0.7]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.7
-[1.0.6]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.6
-[1.0.5]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.5
-[1.0.4]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.4
-[1.0.3]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.3
-[1.0.2]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.2
-[1.0.1]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.1
-[1.0.0]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.0
+[1.0.9]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.9
+[1.0.8]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.8
+[1.0.7]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.7
+[1.0.6]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.6
+[1.0.5]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.5
+[1.0.4]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.4
+[1.0.3]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.3
+[1.0.2]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.2
+[1.0.1]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.1
+[1.0.0]: https://github.com/Shamsy-Ventures/claude-sandbox-plugin/releases/tag/v1.0.0

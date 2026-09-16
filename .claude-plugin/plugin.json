@@ -5,6 +5,6 @@
   "author": {
     "name": "rshamsy"
   },
-  "repository": "https://github.com/rshamsy/claude-sandbox-plugin",
+  "repository": "https://github.com/Shamsy-Ventures/claude-sandbox-plugin",
   "keywords": ["sandbox", "docker", "container", "resume", "permissions"]
 }
