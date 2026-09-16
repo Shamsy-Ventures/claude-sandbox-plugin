@@ -4,6 +4,20 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.9] - 2026-09-16
+
+### Fixed
+- **Repo-scoped `ls`/`stop` could attribute another project's session to a
+  sandbox.** Claimant counting — which decides whether a session can be
+  identified or is `?shared` — ran only over the containers being displayed.
+  In a repo-scoped listing a container mounted at `/workspace` therefore looked
+  like the sole claimant of `~/.claude/projects/-workspace`, and the inference
+  fell through to whichever neighbouring project had written there most
+  recently. Observed live: `hubtrack-sandbox` reported a wedding-planner
+  session and a 12-minute idle time while actually dormant for 68 days.
+  Sharing is a host-wide property, so claimants are now always counted
+  host-wide regardless of display scope.
+
 ## [1.0.8] - 2026-09-16
 
 ### Fixed
@@ -173,6 +187,7 @@ All notable changes to this plugin are documented here. Versions follow the
 - Embedded `sandbox.sh` fallback for restricted sessions.
 - Marketplace manifest for installation via `/plugin marketplace add`.
 
+[1.0.9]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.9
 [1.0.8]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.8
 [1.0.7]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.7
 [1.0.6]: https://github.com/rshamsy/claude-sandbox-plugin/releases/tag/v1.0.6

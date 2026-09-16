@@ -144,7 +144,7 @@ The skill invocation message states the base directory (e.g. "Base directory for
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
 
-SANDBOX_SH_VERSION="1.0.8"
+SANDBOX_SH_VERSION="1.0.9"
 
 MODE=@DOLLAR@{1:-"safe"}
 TRUST_MODE=@DOLLAR@{2:-"full"}
@@ -661,7 +661,14 @@ render_table() {
 
     # Pass 1: work out which containers share a transcript directory, so pass 2
     # can tell an identified session from an unidentifiable one.
-    build_claims "@DOLLAR@{ROW_NAMES[@]}"
+    #
+    # Always count claimants HOST-WIDE, never just the rows being displayed.
+    # Sharing is a global property: a repo-scoped listing that counted only its
+    # own containers would see a sole claimant of ~/.claude/projects/-workspace
+    # and confidently attribute a neighbouring project's session to it.
+    local _all=()
+    mapfile -t _all < <(enumerate_sandboxes "all")
+    build_claims "@DOLLAR@{_all[@]}"
     for i in "@DOLLAR@{!ROW_NAMES[@]}"; do
         ROW_CLAIMANTS+=("@DOLLAR@{CLAIMS_BY_NAME[@DOLLAR@{ROW_NAMES[@DOLLAR@i]}]:-1}")
     done
