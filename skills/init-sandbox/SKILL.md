@@ -151,13 +151,17 @@ The skill invocation message states the base directory (e.g. "Base directory for
 # Claude Code inside a sandbox is updated at most once a day per container.
 # Set SANDBOX_UPDATE=1 to force an update check now.
 #
+# This script upgrades itself: when the installed claude-sandbox plugin has a
+# newer sandbox.sh, it replaces this copy (keeping a .bak) and re-runs your
+# command. It never downgrades. Set SANDBOX_NO_AUTO_UPGRADE=1 to turn it off.
+#
 # When a sandbox already exists for this project and you run full/safe/shell in
 # an interactive terminal, you get a picker: attach to an existing container
 # (showing what's running there + its description) or create a new, named one.
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
 
-SANDBOX_SH_VERSION="1.0.10"
+SANDBOX_SH_VERSION="1.0.11"
 
 MODE=@DOLLAR@{1:-"safe"}
 TRUST_MODE=@DOLLAR@{2:-"full"}
@@ -1268,6 +1272,36 @@ resolve_container() {
     fi
 }
 
+# --- Self-upgrade from the installed plugin ---
+# sandbox.sh is copied into each repo, so a plugin release does not reach a
+# repo until something re-copies it. Do that on every run: when the installed
+# plugin carries a newer sandbox.sh, replace this file and re-run the same
+# command with it. Never downgrades. SANDBOX_NO_AUTO_UPGRADE=1 turns it off.
+auto_upgrade() {
+    local plugin src new self tmp
+    [ "@DOLLAR@{SANDBOX_NO_AUTO_UPGRADE:-}" = "1" ] && return 0
+    [ -n "@DOLLAR@{SANDBOX_JUST_UPGRADED:-}" ] && return 0   # we are the re-run
+    plugin=@DOLLAR@(find_plugin_dir) || return 0
+    src="@DOLLAR@plugin/skills/init-sandbox/templates/sandbox.sh"
+    new=@DOLLAR@(sh_version_of "@DOLLAR@src")
+    version_lt "@DOLLAR@SANDBOX_SH_VERSION" "@DOLLAR@new" || return 0
+
+    # Bash reads a script while running it, so never rewrite this file in
+    # place: write a sibling and rename it over, which swaps the inode.
+    self="@DOLLAR@SCRIPT_DIR/@DOLLAR@(basename "@DOLLAR@0")"
+    tmp=@DOLLAR@(mktemp "@DOLLAR@self.XXXXXX") || return 0
+    if ! { cp "@DOLLAR@src" "@DOLLAR@tmp" && chmod 755 "@DOLLAR@tmp"; }; then rm -f "@DOLLAR@tmp"; return 0; fi
+    cp "@DOLLAR@self" "@DOLLAR@self.bak-@DOLLAR@SANDBOX_SH_VERSION" 2>/dev/null
+    mv "@DOLLAR@tmp" "@DOLLAR@self" || { rm -f "@DOLLAR@tmp"; return 0; }
+    echo "sandbox.sh @DOLLAR@SANDBOX_SH_VERSION → @DOLLAR@new (from the installed plugin; previous copy kept as @DOLLAR@(basename "@DOLLAR@self").bak-@DOLLAR@SANDBOX_SH_VERSION)"
+    SANDBOX_JUST_UPGRADED=1 exec "@DOLLAR@self" "@DOLLAR@@"
+}
+
+case "@DOLLAR@MODE" in
+    version|--version|-v|help|--help|-h) ;;   # report this copy as it is
+    *) auto_upgrade "@DOLLAR@@" ;;
+esac
+
 # --- Subcommand dispatch (before the session modes) ---
 case "@DOLLAR@MODE" in
     ls|list)   shift; cmd_ls "@DOLLAR@@"; exit @DOLLAR@? ;;
@@ -1532,6 +1566,7 @@ Lifecycle:
   ./sandbox.sh ls [--all]       list sandboxes + the session each is running
   ./sandbox.sh stop [--all]     pick sandboxes to stop (multi-select)
   ./sandbox.sh upgrade          refresh this script from the plugin
+                                (also happens automatically on every run)
 
 Container tracking:
   - .sandbox-state.json records container name/ID after first run

@@ -20,6 +20,7 @@ A Claude Code plugin that sets up Docker-based sandboxes with permission profile
 - **Model choice**: Every launch asks which model to use (Enter keeps your last choice; `SANDBOX_MODEL` skips the question)
 - **GitHub CLI & git-lfs**: `gh` and `git-lfs` baked in; `gh` auth shared with the host and wired into git on every entry
 - **Auto-update**: Claude Code inside each sandbox is updated at most once a day (`SANDBOX_UPDATE=1` forces it)
+- **Self-upgrading script**: Each repo's `sandbox.sh` replaces itself with the installed plugin's newer copy on its next run (never downgrades; `SANDBOX_NO_AUTO_UPGRADE=1` opts out)
 - **Plugin support**: Pre-configures ralph-loop plugin inside the container
 
 ## Install

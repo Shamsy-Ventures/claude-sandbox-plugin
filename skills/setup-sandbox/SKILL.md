@@ -230,14 +230,29 @@ ambiguous, so this clears itself as you restart sandboxes.
 
 ## Keeping sandbox.sh current across repos
 
-`sandbox.sh` is generated *into* each repo, so upgrading the plugin does not
-update repos created earlier — they keep running whatever version they were
-scaffolded with.
+`sandbox.sh` is generated *into* each repo, so a plugin release does not by
+itself reach repos created earlier.
 
-**In one repo:** `./sandbox.sh upgrade` re-copies the canonical template from
+**Automatically (v1.0.11+):** every run of `./sandbox.sh` compares its own
+version with the installed plugin's copy. If the plugin's is newer, it replaces
+itself (keeping `sandbox.sh.bak-<oldversion>`), prints one line, and re-runs
+the same command with the new copy:
+
+```
+sandbox.sh 1.0.11 → 1.0.12 (from the installed plugin; previous copy kept as sandbox.sh.bak-1.0.11)
+```
+
+It never downgrades, it skips `version` and `help` so they report the copy as
+it is, and `SANDBOX_NO_AUTO_UPGRADE=1` turns it off. It only sees releases that
+are in the installed plugin, so the chain is: push → `/plugin update
+claude-sandbox` (or marketplace auto-update) → each repo upgrades on its next
+run. If `sandbox.sh` is tracked in a repo's git, the upgrade shows up there as
+a modified file to commit.
+
+**In one repo, by hand:** `./sandbox.sh upgrade` re-copies the canonical template from
 the installed plugin, keeping a `sandbox.sh.bak-<oldversion>`.
 
-**Across every repo:** run the plugin's standalone propagation script:
+**Across every repo at once** (including repos you have not run since, and copies older than v1.0.11, which predate self-upgrade): run the plugin's standalone propagation script:
 
 ```bash
 bash ~/.claude/plugins/cache/*/claude-sandbox/*/skills/init-sandbox/templates/sync-sandboxes.sh --dry-run

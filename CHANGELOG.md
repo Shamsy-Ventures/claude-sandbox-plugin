@@ -4,6 +4,19 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.11] - 2026-10-12
+
+### Added
+- **`sandbox.sh` upgrades itself from the installed plugin.** Each repo holds
+  its own copy of the script, so a release used to reach a repo only when
+  someone ran `upgrade` or `sync-sandboxes.sh`. Every run now compares its
+  version with the plugin's copy. When the plugin's is newer, it swaps itself
+  for it (written to a sibling file and renamed over, never rewritten in
+  place, since bash reads a script as it runs), keeps
+  `sandbox.sh.bak-<oldversion>`, and re-runs the same command. It never
+  downgrades, it skips `version` and `help`, and `SANDBOX_NO_AUTO_UPGRADE=1`
+  turns it off. Copies older than 1.0.11 still need one `sync-sandboxes.sh` run.
+
 ## [1.0.10] - 2026-10-12
 
 ### Fixed
