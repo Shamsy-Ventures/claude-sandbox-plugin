@@ -73,14 +73,60 @@ The picker only appears once a container exists — the very first `./sandbox.sh
 
 ### Resume Mode
 ```bash
-./sandbox.sh resume        # full trust (default)
-./sandbox.sh resume safe   # safe mode
+./sandbox.sh resume            # full trust (default): pick a session
+./sandbox.sh resume safe       # safe mode
+./sandbox.sh resume --last     # this checkout's most recent session, no picker
+./sandbox.sh resume 6764e752   # a specific session, by id or id prefix
 ```
-- Reads `.sandbox-state.json` to find containers belonging to this project
-- If multiple containers exist, presents an interactive picker with status
-- If only one exists, auto-selects it
-- Starts the container if stopped, then runs `claude --resume` for interactive session picker
-- Falls back to scanning docker by project name if no state file exists
+Resume is session-first: you pick the *conversation*, and the script works out where to run it.
+
+```
+Sessions in ~/Projects/hubtrack (newest first):
+   1) 5m   6764e752  open in hubtrack-sandbox-pr-reviews   What are the pr-review…
+   2) 3d   399d7896  in hubtrack-sandbox-pr-reviews        Migrate the billing tables
+   3) 9d   a1c2e3f4                                        Fix the login redirect
+```
+
+- Lists this checkout's transcripts (newest first, up to 20) with age, topic, and the sandbox each last ran in (`open in` = Claude is running there now).
+- Runs the session in the sandbox it last ran in. Otherwise it uses this checkout's only sandbox, asks which one if there are several, or creates one if there are none. A stopped container is started.
+- Any Claude already running in that sandbox is stopped first (see [One Claude per sandbox](#one-claude-per-sandbox)).
+- Records the resumed session id against the container, so `ls`/`stop` report what is really running.
+- Without a TTY, `resume` behaves like `resume --last`.
+
+After a crash or reboot, `./sandbox.sh ls --all` shows each sandbox's last session; `./sandbox.sh resume --last` in a repo brings that repo's session straight back.
+
+Containers created before 1.0.3 run at `/workspace` and cannot see this checkout's transcripts, so resume skips them and says so. Their old sessions are still reachable from inside: `./sandbox.sh shell`, then `claude --resume`.
+
+## One Claude per sandbox
+
+`docker exec -it` does not kill the process it started when the client goes away. After an SSH drop or a closed terminal tab, Claude keeps running inside the container, using memory, with nothing on screen to show it. Before 1.0.10 every later launch started another Claude beside it, and a host could build up a dozen invisible sessions and run out of memory.
+
+Every launch that starts Claude (default/`full`/`resume`) now checks the target container first:
+
+- **No terminal attached** (the usual leftover): the old Claude, and everything it spawned, is stopped automatically, with a one-line notice of how many and how much memory.
+- **A terminal is still attached** (the session is probably open in another window): you are asked before it is stopped. Without a TTY the script refuses instead.
+
+The transcript is on the host either way, so a stopped session can always be resumed. `shell` mode does not stop anything. `ls` shows `claude×N` when a sandbox has more than one Claude running.
+
+## Model choice
+
+Every launch that starts Claude asks which model to use:
+
+```
+Model for this session (aliases always mean the latest of that family):
+  1) default  your account / settings default
+  2) fable    most capable; slowest and most expensive
+  3) opus     strong all-rounder for coding and agentic work
+  4) sonnet   fast and cheaper; good for everyday work
+  5) haiku    fastest and cheapest; simple tasks
+  o) other — type a model name (e.g. claude-opus-5-5, opus[1m])
+Choose [Enter = sonnet]:
+```
+
+- The aliases are Claude Code's own. Each always resolves to the newest model in that family, so the list does not go stale.
+- If `ANTHROPIC_API_KEY` is set on the host, the specific model IDs that key can use are listed as well, fetched from the Models API.
+- Enter keeps the last choice, which is remembered per repo in `.sandbox-state.json`. `SANDBOX_MODEL=<alias-or-id>` skips the question; without a TTY the last choice is used.
+- You can still switch inside Claude with `/model`.
 
 ## Session Carry-Over (Same-Path Mounting)
 
@@ -102,23 +148,23 @@ The image bundles `gh` and `git-lfs`. On every entry, `sandbox.sh` bootstraps th
 
 `gh` auth is shared with the host via the `~/.config/gh` mount, so `gh auth login` once — on the host or in any container — and every sandbox stays authenticated. Alternatively set `GH_TOKEN` in the environment. If `gh` is unauthenticated, the bootstrap prints a one-time hint.
 
-## Auto-Update on Entry
+## Daily Auto-Update
 
-Every time `sandbox.sh` enters a container — newly created, restarted, or already running, in any mode (default/`full`/`shell`/`resume`) — it updates Claude Code to the latest version before launching:
+When `sandbox.sh` enters a container (any mode), it updates Claude Code to the latest version, at most once a day per container:
 
 ```bash
 docker exec -u root <container> npm install -g @anthropic-ai/claude-code@latest
 ```
 
-It runs as root because the CLI lives in the root-owned npm global directory inside the image. If the update fails (e.g. no network), a warning is printed and the existing installed version is used.
+The last check is stamped in `~/.cache/claude-sandbox/claude-updated-<container-id>`. The stamp is keyed by container id, so a recreated container is always updated on its first launch. `SANDBOX_UPDATE=1 ./sandbox.sh …` forces a check. It runs as root because the CLI lives in the root-owned npm global directory inside the image. If the update fails (e.g. no network), a warning is printed and the installed version is used.
 
 New containers are created detached (`docker compose up -d`), updated, and then attached — so even if the Docker image was built from a cached layer with an older CLI, the container gets the latest version before Claude first starts.
 
-## Lifecycle: ls / stop / reap
+## Lifecycle: ls / stop
 
 Sandboxes used to only ever be created or attached to — nothing in the plugin
 stopped one. Containers therefore accumulated until the host ran out of memory.
-These three commands close that loop.
+These commands close that loop.
 
 **Stopping a sandbox is non-destructive.** The repo and `~/.claude` are
 bind-mounted from the host, so your code and every session transcript live
@@ -138,6 +184,8 @@ Lists this repo's sandboxes, or every sandbox on the host with `--all`:
 ```
 
 - **TOOL** — what is actually running inside: `claude`, `codex`, `shell`, `-`.
+  `claude×3` means three Claudes are running in one sandbox, left behind by
+  dropped terminals; the next launch there stops the extras.
 - **SESSION** — the Claude session id. Bare (`399d7896`) means sandbox.sh
   launched it with an explicit `--session-id` and recorded it, so the mapping is
   a fact. `~` means it was inferred from transcript timestamps. `?shared` means
@@ -164,12 +212,9 @@ Confirm stop? [y/N]:
 A live session is safe to interrupt — the transcript is already on the host, so
 `./sandbox.sh resume` (or `claude --resume <id>`) picks it back up.
 
-### `./sandbox.sh reap [--days N] [--dry-run] [--yes]`
-
-Host-wide. Stops every running sandbox whose session transcript has not been
-written in `N` days (default 7). `--dry-run` reports without acting; `--yes`
-skips the prompt so it can run from a systemd timer or cron. Without a TTY and
-without `--yes` it refuses rather than stopping things unattended.
+`reap` (automatic stopping of idle sandboxes) was removed in 1.0.10. Its idle
+detection could misjudge a sandbox you were actively using, and the problem it
+worked around, sessions piling up, is now prevented at launch. Use `stop`.
 
 ### Why a session can be `?shared`
 

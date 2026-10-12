@@ -5,13 +5,15 @@
 #   ./sandbox.sh              - New session in safe mode
 #   ./sandbox.sh full         - New session in full trust mode
 #   ./sandbox.sh shell        - Open container shell
-#   ./sandbox.sh resume       - Resume: pick container + session interactively (full trust)
-#   ./sandbox.sh resume safe  - Resume: pick container + session interactively (safe mode)
+#   ./sandbox.sh resume       - Pick a past session of this repo and resume it in
+#                               its sandbox (full trust; starts/creates it as needed)
+#   ./sandbox.sh resume safe  - Same, in safe mode
+#   ./sandbox.sh resume --last      - Resume this repo's most recent session, no picker
+#   ./sandbox.sh resume <id>        - Resume a specific session (id or id prefix)
 #
 # Lifecycle:
 #   ./sandbox.sh ls [--all]        - List sandboxes for this repo (--all: host-wide)
 #   ./sandbox.sh stop [--all]      - Pick sandboxes to stop (multi-select)
-#   ./sandbox.sh reap [--days N]   - Stop sandboxes idle past a threshold (host-wide)
 #   ./sandbox.sh upgrade [--all]   - Refresh sandbox.sh from the installed plugin
 #   ./sandbox.sh version           - Print this script's version
 #
@@ -19,13 +21,24 @@
 # from the host, so code and session transcripts live outside the container.
 # `docker start` (or any launch mode) picks up exactly where you left off.
 #
+# One Claude per sandbox: before launching Claude, any Claude already running in
+# the container is stopped. If its terminal is gone (an SSH drop leaves it
+# running, invisibly), that happens automatically; if a terminal is still
+# attached, you are asked first. Transcripts are on the host, so nothing is lost.
+#
+# Every Claude launch asks which model to use (Enter keeps the last choice).
+# Set SANDBOX_MODEL=<alias-or-id> to skip the question.
+#
+# Claude Code inside a sandbox is updated at most once a day per container.
+# Set SANDBOX_UPDATE=1 to force an update check now.
+#
 # When a sandbox already exists for this project and you run full/safe/shell in
 # an interactive terminal, you get a picker: attach to an existing container
 # (showing what's running there + its description) or create a new, named one.
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
 
-SANDBOX_SH_VERSION="1.0.9"
+SANDBOX_SH_VERSION="1.0.10"
 
 MODE=${1:-"safe"}
 TRUST_MODE=${2:-"full"}
@@ -77,27 +90,39 @@ session_dir_for() {
 summary_of_file() {
     local f="$1" s
     [ -f "$f" ] || return 0
-    s=$(jq -rs '[.[] | select(.type=="summary") | .summary] | last // empty' "$f" 2>/dev/null)
+    # Read only the lines that matter: transcripts run to many MB, and the
+    # resume picker summarises a screenful of them.
+    s=$(tac "$f" 2>/dev/null | grep -m1 '"type": *"summary"' | jq -r '.summary // empty' 2>/dev/null)
     if [ -z "$s" ]; then
         # No rollup summary yet — fall back to the first real user message,
         # skipping the synthetic blocks Claude injects (slash-command echoes,
         # caveat preambles, hook output) which otherwise read as gibberish.
-        s=$(jq -rs 'first(.[] | select(.type=="user")
+        s=$(grep -m20 '"type": *"user"' "$f" 2>/dev/null | jq -rn 'first(inputs
                     | .message.content
                     | if type=="array" then (map(select(.type=="text").text) | join(" ")) else tostring end
                     | select(test("^<(local-command|command-name|command-message|system-reminder)") | not))
-                    // empty' "$f" 2>/dev/null)
+                    // empty' 2>/dev/null)
     fi
     [ -n "$s" ] && printf '%s' "$s" \
         | sed -e 's/<[^>]*>//g' -e 's/^[[:space:]]*//' \
         | tr '\n\t' '  ' | tr -s ' ' | cut -c1-58
 }
 
-# Host PID of the claude process running inside a container, if any.
+# Host PIDs of every Claude Code CLI process inside a container, one per line.
 # `docker top` reports host PIDs, so /proc/<pid>/... is readable from here.
+# Matches the CLI itself (native `claude` binary, or node running its entry
+# point) by argv[0]/argv[1] — not anything that merely mentions "claude", since
+# the container user's home is /home/claude and every plugin/MCP helper path
+# contains it.
+claude_cli_pids() {
+    docker top "$1" -eo pid,args 2>/dev/null | tail -n +2 | awk '
+        $2 ~ /(^|\/)claude(\.exe)?$/ { print $1; next }
+        $2 ~ /(^|\/)node$/ && $3 ~ /((^|\/)claude|claude-code\/cli\.js)$/ { print $1 }'
+}
+
+# Host PID of the (first) claude process running inside a container, if any.
 container_claude_pid() {
-    docker top "$1" -eo pid,args 2>/dev/null | tail -n +2 \
-        | awk '{pid=$1; $1=""; if ($0 ~ /claude/ && $0 !~ /npm (install|i) / && $0 !~ /claude-code@/) {print pid; exit}}'
+    claude_cli_pids "$1" | head -1
 }
 
 # The cwd a container's claude process is running in (its session key).
@@ -218,6 +243,14 @@ age_short() {
 # Container helpers
 # =============================================================================
 
+# --- Helper: replace the containers list, keeping any other state keys ---
+write_containers() {
+    local base="{}"
+    [ -f "$STATE_FILE" ] && base=$(jq '.' "$STATE_FILE" 2>/dev/null || echo "{}")
+    echo "$base" | jq --argjson c "$1" '.containers = $c' > "$STATE_FILE.tmp" \
+        && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
 # --- Helper: record container signature (with optional user description) ---
 record_container() {
     local name="$1"
@@ -247,7 +280,7 @@ record_container() {
         '{name: $name, id: $id, image: $image, created_at: $created, description: $description}')
     entries=$(echo "$entries" | jq --argjson e "$new_entry" '. + [$e]')
 
-    jq -n --argjson c "$entries" '{containers: $c}' > "$STATE_FILE"
+    write_containers "$entries"
     echo "Container recorded in .sandbox-state.json"
 }
 
@@ -262,10 +295,14 @@ record_session() {
     if [ "$(echo "$entries" | jq --arg n "$name" '[.[] | select(.name==$n)] | length')" = "0" ]; then
         entries=$(echo "$entries" | jq --arg n "$name" '. + [{name: $n, description: ""}]')
     fi
+    # A session runs in one place: resuming it here clears it from any other
+    # container that recorded it, so ls and resume never show it twice.
     entries=$(echo "$entries" | jq \
         --arg n "$name" --arg s "$sid" --arg t "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-        '[.[] | if .name == $n then . + {session_id: $s, session_started_at: $t} else . end]')
-    jq -n --argjson c "$entries" '{containers: $c}' > "$STATE_FILE"
+        '[.[] | if .name == $n then . + {session_id: $s, session_started_at: $t}
+                elif .session_id == $s then del(.session_id, .session_started_at)
+                else . end]')
+    write_containers "$entries"
 }
 
 # --- Helper: generate a session UUID ---
@@ -279,57 +316,6 @@ new_uuid() {
     fi
 }
 
-# --- Helper: pick a container interactively ---
-pick_container() {
-    local containers=()
-
-    # First, try containers from the state file (known to this project)
-    if [ -f "$STATE_FILE" ]; then
-        local known_names
-        known_names=$(jq -r '.containers[].name' "$STATE_FILE" 2>/dev/null)
-        while IFS= read -r name; do
-            [ -z "$name" ] && continue
-            local status
-            status=$(docker ps -a --filter "name=^${name}$" --format '{{.Status}}' 2>/dev/null)
-            if [ -n "$status" ]; then
-                containers+=("${name}\t${status}")
-            fi
-        done <<< "$known_names"
-    fi
-
-    # Fallback: scan docker for containers matching the project name
-    if [ ${#containers[@]} -eq 0 ]; then
-        mapfile -t containers < <(docker ps -a --filter "name=${PROJECT_NAME}" --format '{{.Names}}\t{{.Status}}' 2>/dev/null)
-    fi
-
-    if [ ${#containers[@]} -eq 0 ]; then
-        echo "Error: No containers found. Run './sandbox.sh full' first." >&2
-        exit 1
-    fi
-
-    if [ ${#containers[@]} -eq 1 ]; then
-        SELECTED=$(echo -e "${containers[0]}" | cut -f1)
-        echo "Auto-selected container: $SELECTED" >&2
-    else
-        echo "" >&2
-        echo "Available containers:" >&2
-        for i in "${!containers[@]}"; do
-            local name=$(echo -e "${containers[$i]}" | cut -f1)
-            local status=$(echo -e "${containers[$i]}" | cut -f2)
-            echo "  $((i+1))) $name  [$status]" >&2
-        done
-        echo "" >&2
-        read -rp "Select container [1-${#containers[@]}]: " choice
-        if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#containers[@]} ]; then
-            echo "Invalid selection." >&2
-            exit 1
-        fi
-        SELECTED=$(echo -e "${containers[$((choice-1))]}" | cut -f1)
-    fi
-
-    echo "$SELECTED"
-}
-
 # --- Helper: ensure container is running ---
 ensure_running() {
     local container="$1"
@@ -339,14 +325,172 @@ ensure_running() {
     fi
 }
 
-# --- Helper: update Claude Code to the latest version ---
+# --- Helper: update Claude Code, at most once a day per container ---
 # Runs as root because the CLI is installed in the root-owned npm global dir.
-update_claude() {
-    local container="$1"
-    echo "Updating Claude Code to the latest version..."
-    if ! docker exec -u root "$container" npm install -g @anthropic-ai/claude-code@latest; then
+# The stamp is keyed by container id, so a recreated container (same name, new
+# image layer) is always updated on first launch. SANDBOX_UPDATE=1 forces it.
+maybe_update_claude() {
+    local container="$1" id stamp dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sandbox"
+    id=$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null | head -c 12)
+    stamp="$dir/claude-updated-$id"
+    if [ "${SANDBOX_UPDATE:-}" != "1" ] && [ -n "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
+        echo "Claude Code: last update check $(age_short "$(stat -c %Y "$stamp")") ago (daily; SANDBOX_UPDATE=1 to force)."
+        return 0
+    fi
+    echo "Updating Claude Code (daily check)..."
+    if docker exec -u root "$container" npm install -g --no-fund --no-audit --loglevel=error @anthropic-ai/claude-code@latest >/dev/null; then
+        mkdir -p "$dir" && touch "$stamp"
+        echo "Claude Code: $(docker exec "$container" claude --version 2>/dev/null | head -1)"
+    else
         echo "WARNING: Claude Code update failed (offline?). Continuing with installed version." >&2
     fi
+}
+
+# --- Helpers: one Claude per sandbox ---
+#
+# `docker exec -it` does not kill the process it started when the client goes
+# away: after an SSH drop or a closed terminal tab, Claude keeps running inside
+# the container, holding its memory, with nothing on screen to show it. Every
+# later launch used to start another one beside it, which is how a host ends
+# up with a dozen invisible sessions and runs out of memory.
+
+# Number of host-side `docker exec` clients currently attached to a container.
+attached_clients() {
+    ps -eo args= 2>/dev/null | awk -v c="$1" '
+        $1 ~ /(^|\/)docker$/ && $2 == "exec" { for (i = 3; i <= NF; i++) if ($i == c) { n++; break } }
+        END { print n + 0 }'
+}
+
+# A host PID and all its descendants (host PIDs), from the container's table.
+descendants_of() {
+    local c="$1" root="$2"
+    docker top "$c" -eo pid,ppid 2>/dev/null | tail -n +2 | awk -v r="$root" '
+        { kids[$2] = kids[$2] " " $1 }
+        END { q = r; while (q != "") { split(q, a, " "); q = ""
+                for (i in a) if (a[i] != "") { print a[i]; q = q " " kids[a[i]] } } }'
+}
+
+# The PID a host process has inside its container's PID namespace.
+inner_pid() {
+    awk '/^NSpid:/ { print $NF }' "/proc/$1/status" 2>/dev/null
+}
+
+# Resident memory of a host PID, in MB.
+rss_mb() {
+    awk '/^VmRSS:/ { printf "%d", $2 / 1024 }' "/proc/$1/status" 2>/dev/null
+}
+
+# Make sure no Claude is running in a container before starting one.
+# Orphans (no terminal attached) are stopped without asking; if a terminal is
+# still attached, the user decides. Exits the script if they decline.
+clear_live_claude() {
+    local c="$1" pids=() p clients total=0 ok
+    mapfile -t pids < <(claude_cli_pids "$c")
+    [ ${#pids[@]} -eq 0 ] && return 0
+    for p in "${pids[@]}"; do total=$(( total + $(rss_mb "$p" || echo 0) )); done
+    clients=$(attached_clients "$c")
+
+    if [ "$clients" -gt 0 ]; then
+        echo ""
+        echo "$c already has ${#pids[@]} Claude process(es) running (~${total} MB),"
+        echo "and $clients terminal(s) are attached to this container — probably a session"
+        echo "you have open elsewhere. Starting here will close it there; its transcript is saved."
+        if ! [ -t 0 ]; then
+            echo "Refusing to interrupt it without a terminal to confirm." >&2
+            exit 1
+        fi
+        read -rp "Stop it and continue here? [y/N]: " ok
+        case "$ok" in
+            y|Y|yes|YES) ;;
+            *) echo "Cancelled — switch to the terminal where it is open."; exit 0 ;;
+        esac
+    else
+        echo "Stopping ${#pids[@]} orphaned Claude process(es) in $c (~${total} MB; terminal gone, transcript saved)."
+    fi
+
+    # Signal Claude and everything it spawned (shells, MCP servers), via the
+    # container's own PID numbers so this works whatever uid the container uses.
+    local all=() inner=() q
+    for p in "${pids[@]}"; do mapfile -t -O "${#all[@]}" all < <(descendants_of "$c" "$p"); done
+    for q in "${all[@]}"; do p=$(inner_pid "$q"); [ -n "$p" ] && inner+=("$p"); done
+    [ ${#inner[@]} -eq 0 ] && return 0
+    # `kill` is the shell builtin here: slim images ship no procps.
+    docker exec -u root "$c" sh -c 'kill -TERM "$@"' sh "${inner[@]}" 2>/dev/null
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -z "$(claude_cli_pids "$c")" ] && break
+        sleep 0.5
+    done
+    docker exec -u root "$c" sh -c 'kill -KILL "$@"' sh "${inner[@]}" 2>/dev/null
+    return 0
+}
+
+# --- Helper: choose the model for a Claude launch ---
+# Sets MODEL_ARGS (empty, or --model <m>). Asks on every interactive launch;
+# Enter keeps the last choice for this repo. SANDBOX_MODEL skips the question.
+#
+# The aliases are Claude Code's own: each always resolves to the newest model
+# of that family, so this list does not go stale. With ANTHROPIC_API_KEY set on
+# the host, the full list of model IDs the key can use is shown as well.
+MODEL_ALIASES=(default fable opus sonnet haiku)
+MODEL_NOTES=(
+    "your account / settings default"
+    "most capable; slowest and most expensive"
+    "strong all-rounder for coding and agentic work"
+    "fast and cheaper; good for everyday work"
+    "fastest and cheapest; simple tasks"
+)
+
+choose_model() {
+    MODEL_ARGS=()
+    local m last choice i ids=()
+    last=$([ -f "$STATE_FILE" ] && jq -r '.last_model // empty' "$STATE_FILE" 2>/dev/null)
+    last="${last:-default}"
+
+    if [ -n "${SANDBOX_MODEL:-}" ]; then
+        m="$SANDBOX_MODEL"
+    elif ! [ -t 0 ]; then
+        m="$last"
+    else
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            mapfile -t ids < <(curl -fsS --max-time 5 "https://api.anthropic.com/v1/models?limit=100" \
+                -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" 2>/dev/null \
+                | jq -r '.data[]? | "\(.id)\t\(.display_name)"' 2>/dev/null)
+        fi
+        echo ""
+        echo "Model for this session (aliases always mean the latest of that family):"
+        for i in "${!MODEL_ALIASES[@]}"; do
+            printf "  %d) %-8s %s\n" "$((i+1))" "${MODEL_ALIASES[$i]}" "${MODEL_NOTES[$i]}"
+        done
+        if [ ${#ids[@]} -gt 0 ]; then
+            echo "  Specific models available to your API key:"
+            for i in "${!ids[@]}"; do
+                printf "  %d) %-26s %s\n" "$(( ${#MODEL_ALIASES[@]} + i + 1 ))" "${ids[$i]%%$'\t'*}" "${ids[$i]#*$'\t'}"
+            done
+        fi
+        echo "  o) other — type a model name (e.g. claude-opus-5-5, opus[1m])"
+        echo "  (You can still switch inside Claude with /model.)"
+        read -rp "Choose [Enter = $last]: " choice
+        if [ -z "$choice" ]; then
+            m="$last"
+        elif [ "$choice" = "o" ] || [ "$choice" = "O" ]; then
+            read -rp "Model name: " m
+            m="${m:-$last}"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#MODEL_ALIASES[@]} ]; then
+            m="${MODEL_ALIASES[$((choice-1))]}"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt ${#MODEL_ALIASES[@]} ] \
+             && [ "$choice" -le $(( ${#MODEL_ALIASES[@]} + ${#ids[@]} )) ]; then
+            m="${ids[$((choice - ${#MODEL_ALIASES[@]} - 1))]%%$'\t'*}"
+        else
+            m="$choice"   # typed a name directly
+        fi
+        # Remember it for next time.
+        local base="{}"
+        [ -f "$STATE_FILE" ] && base=$(jq '.' "$STATE_FILE" 2>/dev/null || echo "{}")
+        echo "$base" | jq --arg m "$m" '.last_model = $m' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+    fi
+
+    [ -n "$m" ] && [ "$m" != "default" ] && MODEL_ARGS=(--model "$m")
+    echo "Model: $m"
 }
 
 # --- Helper: apply permission profile ---
@@ -393,7 +537,7 @@ running_tool() {
     # `docker top` rejects a format without a PID column ("Couldn't find PID
     # field in ps output"), so ask for pid,args and drop the pid.
     args=$(docker top "$c" -eo pid,args 2>/dev/null | tail -n +2 | cut -d' ' -f2-)
-    if echo "$args" | grep -qiE 'claude-code|@anthropic-ai/claude|(^|/| )claude( |$)'; then
+    if [ -n "$(claude_cli_pids "$c")" ]; then
         echo "claude"
     elif echo "$args" | grep -qiE '(^|/| )codex( |$)|codex'; then
         echo "codex"
@@ -471,7 +615,7 @@ select_or_create() {
 }
 
 # =============================================================================
-# Lifecycle subcommands: ls / stop / reap / upgrade
+# Lifecycle subcommands: ls / stop / upgrade
 # =============================================================================
 
 # Enumerate sandbox containers. Scope "repo" (default) uses this project's state
@@ -563,10 +707,15 @@ render_table() {
         printf "  %-34s %-16s %-7s %-9s %-40s %s\n" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..16})" "-------" "---------" "$(printf '%.0s-' {1..40})" "----"
     fi
 
-    local ambiguous=0
+    local ambiguous=0 stacked=0
     for i in "${!ROW_NAMES[@]}"; do
         n="${ROW_NAMES[$i]}"; st="${ROW_STATUS[$i]}"
         tool=$(running_tool "$n"); [ -z "$tool" ] && tool="-"
+        if [ "$tool" = "claude" ]; then
+            # Several Claudes in one sandbox are leftovers from dropped terminals.
+            local nc; nc=$(claude_cli_pids "$n" | wc -l)
+            [ "$nc" -gt 1 ] && { tool="claude×$nc"; stacked=1; }
+        fi
         IFS=$'\x1f' read -r sid summ kind <<< "$(container_session "$n" "${ROW_CLAIMANTS[$i]}")"
         idle=$(age_short "$(last_activity_epoch "$n" "${ROW_CLAIMANTS[$i]}")")
         repo=$(container_repo_dir "$n")
@@ -600,6 +749,10 @@ render_table() {
     printf "\n"
     printf "  SESSION: Claude session id — bare = recorded at launch, ~ = inferred\n"
     printf "  IDLE   : time since this session's transcript was last written\n"
+    if [ "$stacked" = "1" ]; then
+        printf "  claude×N — several Claudes in one sandbox, left behind by dropped\n"
+        printf "             terminals. The next launch there stops the extras.\n"
+    fi
     if [ "$ambiguous" = "1" ]; then
         printf "\n"
         printf "  ?shared — several live sandboxes write to one transcript directory, so\n"
@@ -645,7 +798,7 @@ cmd_stop() {
     [ "$1" = "--all" ] && scope="all"
 
     if ! [ -t 0 ]; then
-        echo "Error: 'stop' is interactive and needs a terminal. Use 'reap --yes' for automation." >&2
+        echo "Error: 'stop' is interactive and needs a terminal. For scripts, use: docker stop <name>" >&2
         exit 1
     fi
 
@@ -705,77 +858,6 @@ cmd_stop() {
     done <<< "$picks"
     echo ""
     echo "Restart any of them with: docker start <name>  — or just ./sandbox.sh in that repo."
-}
-
-cmd_reap() {
-    local days=7 dry=0 assume_yes=0
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --days) days="$2"; shift 2 ;;
-            --days=*) days="${1#*=}"; shift ;;
-            --dry-run|-n) dry=1; shift ;;
-            --yes|-y) assume_yes=1; shift ;;
-            *) echo "Unknown option for reap: $1" >&2; exit 1 ;;
-        esac
-    done
-    [[ "$days" =~ ^[0-9]+$ ]] || { echo "--days needs a number" >&2; exit 1; }
-
-    local cutoff now n st last idle_days tool targets=() running=()
-    now=$(date +%s)
-    cutoff=$(( now - days * 86400 ))
-
-    while IFS= read -r n; do
-        [ -z "$n" ] && continue
-        docker ps --format '{{.Names}}' | grep -q "^${n}$" || continue   # already stopped
-        running+=("$n")
-    done < <(enumerate_sandboxes "all")
-    [ ${#running[@]} -eq 0 ] && { echo "No running sandboxes."; exit 0; }
-
-    # Claimant counts matter here: without them a dormant sandbox sharing a
-    # transcript directory inherits a sibling's fresh mtime and never gets reaped.
-    build_claims "${running[@]}"
-
-    for n in "${running[@]}"; do
-        last=$(last_activity_epoch "$n" "${CLAIMS_BY_NAME[$n]:-1}")
-        [ "$last" = "0" ] && continue
-        [ "$last" -lt "$cutoff" ] && targets+=("$n")
-    done
-
-    if [ ${#targets[@]} -eq 0 ]; then
-        echo "Nothing to reap: no running sandbox has been idle longer than ${days}d."
-        exit 0
-    fi
-
-    echo ""
-    echo "Idle longer than ${days}d:"
-    local sid summ kind cl
-    for n in "${targets[@]}"; do
-        cl="${CLAIMS_BY_NAME[$n]:-1}"
-        tool=$(running_tool "$n"); [ -z "$tool" ] && tool="idle"
-        IFS=$'\x1f' read -r sid summ kind <<< "$(container_session "$n" "$cl")"
-        [ "$kind" = "ambiguous" ] && sid="?shared"
-        printf "  %-34s  %-7s  %-9s  idle %-5s %s\n" \
-            "$n" "$tool" "${sid:0:8}" "$(age_short "$(last_activity_epoch "$n" "$cl")")" "${summ:+\"$summ\"}"
-    done
-    echo ""
-
-    if [ "$dry" = "1" ]; then
-        echo "(dry run — nothing stopped)"
-        exit 0
-    fi
-
-    if [ "$assume_yes" != "1" ]; then
-        if ! [ -t 0 ]; then
-            echo "Refusing to stop without confirmation in a non-interactive shell. Pass --yes." >&2
-            exit 1
-        fi
-        read -rp "Stop these ${#targets[@]} sandbox(es)? [y/N]: " ok
-        case "$ok" in y|Y|yes|YES) ;; *) echo "Cancelled."; exit 0 ;; esac
-    fi
-
-    for n in "${targets[@]}"; do
-        docker stop "$n" >/dev/null && echo "  stopped  $n"
-    done
 }
 
 # Locate the installed plugin so `upgrade` can re-copy the canonical template.
@@ -882,66 +964,289 @@ cmd_upgrade() {
     fi
 }
 
+# =============================================================================
+# Launching
+# =============================================================================
+
+# Claude keys sessions by cwd, so only a container whose working dir is this
+# checkout's host path sees this checkout's transcripts. Containers created
+# before 1.0.3 run at /workspace and cannot resume them.
+container_matches_workdir() {
+    [ "$(docker inspect --format '{{.Config.WorkingDir}}' "$1" 2>/dev/null)" = "$SANDBOX_WORKDIR" ]
+}
+
+# Existing containers of this repo, one per line.
+repo_containers() {
+    local n
+    while IFS= read -r n; do
+        [ -n "$n" ] && docker ps -a --filter "name=^${n}$" --format '{{.Names}}' 2>/dev/null
+    done < <(enumerate_sandboxes "repo")
+}
+
+# First free default container name for this project.
+suggest_name() {
+    local s="${PROJECT_NAME}-sandbox" k=2
+    while docker ps -a --format '{{.Names}}' | grep -qx "$s"; do
+        s="${PROJECT_NAME}-sandbox-${k}"; k=$((k+1))
+    done
+    printf '%s' "$s"
+}
+
+# Ask for a new sandbox's name and description. Sets NEW_NAME / NEW_DESC.
+prompt_new_container() {
+    local suggest
+    suggest=$(suggest_name)
+    NEW_NAME="$suggest"; NEW_DESC=""
+    [ -t 0 ] || return 0
+    read -rp "Name for new sandbox [${suggest}]: " NEW_NAME
+    NEW_NAME="${NEW_NAME:-$suggest}"
+    if docker ps -a --format '{{.Names}}' | grep -qx "$NEW_NAME"; then
+        echo "A container named '$NEW_NAME' already exists — attach to it instead, or pick another name." >&2
+        exit 1
+    fi
+    read -rp "Short description (what's this sandbox for?): " NEW_DESC
+}
+
+# Build and start a new sandbox container, detached.
+create_container() {
+    local name="$1" desc="$2" proj
+    echo "Creating new container: $name"
+    export SANDBOX_CONTAINER_NAME="$name"
+
+    # Each container is its own compose project so multiple sandboxes can
+    # coexist in one repo (compose otherwise treats the service as a singleton).
+    proj="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^[^a-z0-9]*//')"
+    [ -z "$proj" ] && proj="sandbox"
+
+    # The base compose mounts the main repo at its host path. A worktree created
+    # OUTSIDE that tree is not covered by that mount, so add a runtime override
+    # that also mounts the worktree at its host path. Standard repos and
+    # worktrees created INSIDE the repo tree are subpaths of the repo mount and
+    # need nothing extra.
+    local compose_args=(-f "$SCRIPT_DIR/docker-compose.sandbox.yml")
+    local override="$SCRIPT_DIR/.sandbox-worktree.override.yml"
+    rm -f "$override"
+    case "$SANDBOX_WORKDIR/" in
+        "$SANDBOX_REPO_ROOT/"*) : ;;
+        *)
+            cat > "$override" <<YAML
+services:
+  claude-sandbox:
+    volumes:
+      - $SANDBOX_WORKDIR:$SANDBOX_WORKDIR
+YAML
+            compose_args+=(-f "$override")
+            echo "Worktree outside repo tree — added mount override for $SANDBOX_WORKDIR"
+            ;;
+    esac
+
+    docker compose -p "$proj" "${compose_args[@]}" build
+    docker compose -p "$proj" "${compose_args[@]}" up -d claude-sandbox
+    record_container "$name" "$desc"
+}
+
+# Bring a container up and run a command in it: create or start it, stop any
+# Claude already running there (when launching Claude), update Claude Code if
+# it has not been checked today, record the session, then attach.
+# Args: <container> <create:0|1> <description> <session-id|""> <command...>
+launch() {
+    local c="$1" create="$2" desc="$3" sid="$4"; shift 4
+    if [ "$create" = "1" ]; then create_container "$c" "$desc"; else ensure_running "$c"; fi
+    [ "$1" = "claude" ] && clear_live_claude "$c"
+    maybe_update_claude "$c"
+    bootstrap_container "$c"
+    record_session "$c" "$sid"
+    echo "Attaching to container: $c"
+    docker exec -it "$c" "$@"
+}
+
+# Where a session was last run, for the picker: "open in <c>", "in <c>", or "".
+session_location() {
+    local c
+    c=$([ -f "$STATE_FILE" ] && jq -r --arg s "$1" '.containers[]? | select(.session_id==$s) | .name' "$STATE_FILE" 2>/dev/null | head -1)
+    [ -z "$c" ] && return 0
+    if docker ps --format '{{.Names}}' | grep -qx "$c" && [ -n "$(claude_cli_pids "$c")" ]; then
+        printf 'open in %s' "$c"
+    else
+        printf 'in %s' "$c"
+    fi
+}
+
+# List this checkout's sessions, newest first, and let the user pick one.
+# Sets PICKED_SID.
+pick_session() {
+    local dir="$1" files=() f i sid choice summ
+    mapfile -t files < <(ls -t "$dir"/*.jsonl 2>/dev/null | head -20)
+    [ ${#files[@]} -eq 0 ] && return 1
+    echo ""
+    echo "Sessions in ${SANDBOX_WORKDIR/#$HOME/~} (newest first):"
+    for i in "${!files[@]}"; do
+        f="${files[$i]}"
+        sid=$(basename "$f" .jsonl)
+        summ=$(summary_of_file "$f")
+        printf "  %2d) %-4s %-8s  %-34s %s\n" "$((i+1))" "$(age_short "$(stat -c %Y "$f")")" \
+            "${sid:0:8}" "$(session_location "$sid")" "${summ:-(no messages yet)}"
+    done
+    echo ""
+    read -rp "Resume which? [1-${#files[@]}, Enter = 1]: " choice
+    choice="${choice:-1}"
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#files[@]} ]; then
+        echo "Invalid selection." >&2
+        exit 1
+    fi
+    PICKED_SID=$(basename "${files[$((choice-1))]}" .jsonl)
+}
+
+# Decide which container runs a resumed session: the one it last ran in, else
+# this checkout's only sandbox, else ask (or create one if there is none).
+# Sets TARGET / TARGET_CREATE / TARGET_DESC.
+resolve_container() {
+    local sid="$1" c cands=() legacy=() i choice d
+    TARGET=""; TARGET_CREATE=0; TARGET_DESC=""
+
+    c=$([ -f "$STATE_FILE" ] && jq -r --arg s "$sid" '.containers[]? | select(.session_id==$s) | .name' "$STATE_FILE" 2>/dev/null | head -1)
+    if [ -n "$c" ] && docker ps -a --format '{{.Names}}' | grep -qx "$c" && container_matches_workdir "$c"; then
+        echo "Session last ran in $c."
+        TARGET="$c"; return
+    fi
+
+    while IFS= read -r c; do
+        [ -z "$c" ] && continue
+        if container_matches_workdir "$c"; then cands+=("$c"); else legacy+=("$c"); fi
+    done < <(repo_containers)
+
+    if [ ${#legacy[@]} -gt 0 ]; then
+        echo "Note: ${legacy[*]} run(s) at /workspace (created before 1.0.3) and cannot resume"
+        echo "      this checkout's sessions. Recreate with: docker rm -f <name>  (code and"
+        echo "      transcripts are on the host)."
+    fi
+
+    if [ ${#cands[@]} -eq 0 ]; then
+        echo "No usable sandbox for this checkout — creating one."
+        prompt_new_container
+        TARGET="$NEW_NAME"; TARGET_CREATE=1; TARGET_DESC="$NEW_DESC"; return
+    fi
+    if [ ${#cands[@]} -eq 1 ] || ! [ -t 0 ]; then
+        TARGET="${cands[0]}"; return
+    fi
+
+    echo ""
+    echo "Which sandbox should run it?"
+    for i in "${!cands[@]}"; do
+        d=$([ -f "$STATE_FILE" ] && jq -r --arg n "${cands[$i]}" '.containers[]? | select(.name==$n) | .description // empty' "$STATE_FILE" 2>/dev/null)
+        printf "  %d) %-30s %s\n" "$((i+1))" "${cands[$i]}" "$(describe_container "${cands[$i]}" "$d" "")"
+    done
+    echo "  n) Create a new sandbox"
+    read -rp "Choose [1-${#cands[@]} or n]: " choice
+    if [ "$choice" = "n" ] || [ "$choice" = "N" ]; then
+        prompt_new_container
+        TARGET="$NEW_NAME"; TARGET_CREATE=1; TARGET_DESC="$NEW_DESC"
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#cands[@]} ]; then
+        TARGET="${cands[$((choice-1))]}"
+    else
+        echo "Invalid selection." >&2
+        exit 1
+    fi
+}
+
 # --- Subcommand dispatch (before the session modes) ---
 case "$MODE" in
     ls|list)   shift; cmd_ls "$@"; exit $? ;;
     stop)      shift; cmd_stop "$@"; exit $? ;;
-    reap)      shift; cmd_reap "$@"; exit $? ;;
     upgrade)   shift; cmd_upgrade "$@"; exit $? ;;
     version|--version|-v) echo "sandbox.sh $SANDBOX_SH_VERSION"; exit 0 ;;
-    help|--help|-h) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    help|--help|-h) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    reap)
+        echo "'reap' was removed in 1.0.10. Launching Claude in a sandbox now stops any" >&2
+        echo "Claude left running there, so sessions no longer pile up. To free memory," >&2
+        echo "stop the sandboxes you are done with:  ./sandbox.sh stop [--all]" >&2
+        exit 2 ;;
     safe|full|shell|resume) ;;
     *)
         # Anything else is a typo or a subcommand this copy is too old to know.
         # Earlier versions fell through to safe mode here and *built a container*
         # — so an unrecognised verb silently did the opposite of what was asked.
         echo "Unknown mode: '$MODE'" >&2
-        echo "Modes: safe | full | shell | resume | ls | stop | reap | upgrade | version | help" >&2
+        echo "Modes: safe | full | shell | resume | ls | stop | upgrade | version | help" >&2
         exit 2 ;;
 esac
 
 # --- Resume mode ---
+# Session first: pick the conversation, then it runs in the sandbox it last ran
+# in (started or created as needed), with any Claude already there stopped.
 if [ "$MODE" = "resume" ]; then
-    CONTAINER_NAME=$(pick_container)
+    shift
+    TRUST_MODE="full"; WANT_LAST=0; WANT_ID=""
+    for a in "$@"; do
+        case "$a" in
+            safe|full) TRUST_MODE="$a" ;;
+            --last|last) WANT_LAST=1 ;;
+            -*) echo "Unknown option for resume: $a" >&2; exit 2 ;;
+            *) WANT_ID="$a" ;;
+        esac
+    done
 
+    SDIR=$(session_dir_for "$SANDBOX_WORKDIR") || SDIR=""
+    SID=""
+    if [ -n "$WANT_ID" ]; then
+        mapfile -t matches < <(ls "$SDIR"/"$WANT_ID"*.jsonl 2>/dev/null)
+        if [ ${#matches[@]} -ne 1 ]; then
+            echo "Session '$WANT_ID': ${#matches[@]} matches in ${SANDBOX_WORKDIR/#$HOME/~}." >&2
+            exit 1
+        fi
+        SID=$(basename "${matches[0]}" .jsonl)
+    elif [ "$WANT_LAST" = "1" ] || ! [ -t 0 ]; then
+        f=$(ls -t "$SDIR"/*.jsonl 2>/dev/null | head -1)
+        [ -n "$f" ] && SID=$(basename "$f" .jsonl)
+        [ -n "$SID" ] && echo "Most recent session: ${SID:0:8}  $(summary_of_file "$f")"
+    else
+        pick_session "$SDIR" && SID="$PICKED_SID"
+    fi
+
+    if [ -z "$SID" ]; then
+        echo "No Claude sessions found for ${SANDBOX_WORKDIR/#$HOME/~}." >&2
+        echo "Start one with:  ./sandbox.sh full   (or ./sandbox.sh for safe mode)" >&2
+        echo "Sessions from a /workspace sandbox (pre-1.0.3) are only visible inside it:" >&2
+        echo "  ./sandbox.sh shell   then   claude --resume" >&2
+        exit 1
+    fi
+
+    resolve_container "$SID"
+    choose_model
     if [ "$TRUST_MODE" = "safe" ]; then
         echo "Resuming in safe mode..."
-        CLAUDE_CMD="claude --resume"
+        PERM_ARGS=()
         apply_profile "safe"
     else
         echo "Resuming in full trust mode..."
-        CLAUDE_CMD="claude --dangerously-skip-permissions --resume"
+        PERM_ARGS=(--dangerously-skip-permissions)
         apply_profile "full"
     fi
-
-    ensure_running "$CONTAINER_NAME"
-    update_claude "$CONTAINER_NAME"
-    bootstrap_container "$CONTAINER_NAME"
-    docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
-    exit 0
+    launch "$TARGET" "$TARGET_CREATE" "$TARGET_DESC" "$SID" \
+        claude "${PERM_ARGS[@]}" --resume "$SID" "${MODEL_ARGS[@]}"
+    exit $?
 fi
 
 # --- Normal modes (full / safe / shell) ---
-# New sessions get an explicit --session-id so `ls`/`stop` can report which
-# session a container is running as a recorded fact rather than an inference.
+# New sessions get an explicit --session-id so `ls`/`stop`/`resume` can tell
+# which session a container is running as a recorded fact, not an inference.
 NEW_SESSION_ID=""
 if [ "$MODE" = "full" ]; then
     echo "WARNING: Running in full trust mode - all commands allowed"
     NEW_SESSION_ID=$(new_uuid)
-    CLAUDE_CMD="claude --dangerously-skip-permissions"
-    [ -n "$NEW_SESSION_ID" ] && CLAUDE_CMD="$CLAUDE_CMD --session-id $NEW_SESSION_ID"
+    CLAUDE_CMD=(claude --dangerously-skip-permissions)
     apply_profile "full"
 elif [ "$MODE" = "shell" ]; then
     echo "Opening container shell (run 'claude' to start Claude Code)"
-    CLAUDE_CMD="bash"
+    CLAUDE_CMD=(bash)
     apply_profile "safe"
 else
     echo "Running in safe mode with restricted permissions"
     NEW_SESSION_ID=$(new_uuid)
-    CLAUDE_CMD="claude"
-    [ -n "$NEW_SESSION_ID" ] && CLAUDE_CMD="$CLAUDE_CMD --session-id $NEW_SESSION_ID"
+    CLAUDE_CMD=(claude)
     apply_profile "safe"
 fi
+[ -n "$NEW_SESSION_ID" ] && CLAUDE_CMD+=(--session-id "$NEW_SESSION_ID")
 
 # Choose target container. When at least one sandbox already exists for this
 # project and we have an interactive terminal, offer a picker: attach to an
@@ -959,82 +1264,20 @@ else
 fi
 
 if [ "$SELECTION" = "new" ]; then
-    # Suggest the next free default name, let the user override, and describe it.
-    suggest="${PROJECT_NAME}-sandbox"
-    if docker ps -a --format '{{.Names}}' | grep -q "^${suggest}$"; then
-        k=2
-        while docker ps -a --format '{{.Names}}' | grep -q "^${PROJECT_NAME}-sandbox-${k}$"; do k=$((k+1)); done
-        suggest="${PROJECT_NAME}-sandbox-${k}"
-    fi
-    read -rp "Name for new sandbox [${suggest}]: " NEW_NAME
-    NEW_NAME="${NEW_NAME:-$suggest}"
-    if docker ps -a --format '{{.Names}}' | grep -q "^${NEW_NAME}$"; then
-        echo "A container named '$NEW_NAME' already exists — attach to it instead, or pick another name." >&2
-        exit 1
-    fi
-    read -rp "Short description (what's this sandbox for?): " NEW_DESC
+    prompt_new_container
     CONTAINER_NAME="$NEW_NAME"
     CREATE_NEW=1
 elif [ "$SELECTION" != "none" ] && [ "$SELECTION" != "auto" ]; then
     # User picked an existing container from the menu.
     CONTAINER_NAME="$SELECTION"
-    CREATE_NEW=0
 else
     # none/auto: default name — attach if it exists, otherwise create it.
-    if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-        CREATE_NEW=0
-    else
-        CREATE_NEW=1
-    fi
+    docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME" || CREATE_NEW=1
 fi
 
-if [ "$CREATE_NEW" = "0" ]; then
-    ensure_running "$CONTAINER_NAME"
-    update_claude "$CONTAINER_NAME"
-    bootstrap_container "$CONTAINER_NAME"
-    record_session "$CONTAINER_NAME" "$NEW_SESSION_ID"
-    echo "Attaching to container: $CONTAINER_NAME"
-    docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
-else
-    # Create the container detached, update Claude, then attach.
-    echo "Creating new container: $CONTAINER_NAME"
-    export SANDBOX_CONTAINER_NAME="$CONTAINER_NAME"
-
-    # Each container is its own compose project so multiple sandboxes can
-    # coexist in one repo (compose otherwise treats the service as a singleton).
-    PROJ="$(printf '%s' "$CONTAINER_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g; s/^[^a-z0-9]*//')"
-    [ -z "$PROJ" ] && PROJ="sandbox"
-
-    # The base compose mounts the main repo at its host path. A worktree created
-    # OUTSIDE that tree is not covered by that mount, so add a runtime override
-    # that also mounts the worktree at its host path. Standard repos and
-    # worktrees created INSIDE the repo tree are subpaths of the repo mount and
-    # need nothing extra.
-    COMPOSE_ARGS=(-f "$SCRIPT_DIR/docker-compose.sandbox.yml")
-    OVERRIDE_FILE="$SCRIPT_DIR/.sandbox-worktree.override.yml"
-    rm -f "$OVERRIDE_FILE"
-    case "$SANDBOX_WORKDIR/" in
-        "$SANDBOX_REPO_ROOT/"*) : ;;
-        *)
-            cat > "$OVERRIDE_FILE" <<YAML
-services:
-  claude-sandbox:
-    volumes:
-      - $SANDBOX_WORKDIR:$SANDBOX_WORKDIR
-YAML
-            COMPOSE_ARGS+=(-f "$OVERRIDE_FILE")
-            echo "Worktree outside repo tree — added mount override for $SANDBOX_WORKDIR"
-            ;;
-    esac
-
-    docker compose -p "$PROJ" "${COMPOSE_ARGS[@]}" build
-    docker compose -p "$PROJ" "${COMPOSE_ARGS[@]}" up -d claude-sandbox
-    update_claude "$CONTAINER_NAME"
-    bootstrap_container "$CONTAINER_NAME"
-
-    # Record the new container's signature (with the user's description)
-    record_container "$CONTAINER_NAME" "$NEW_DESC"
-    record_session "$CONTAINER_NAME" "$NEW_SESSION_ID"
-
-    docker exec -it "$CONTAINER_NAME" $CLAUDE_CMD
+if [ "$MODE" != "shell" ]; then
+    choose_model
+    CLAUDE_CMD+=("${MODEL_ARGS[@]}")
 fi
+
+launch "$CONTAINER_NAME" "$CREATE_NEW" "$NEW_DESC" "$NEW_SESSION_ID" "${CLAUDE_CMD[@]}"

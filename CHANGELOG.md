@@ -4,6 +4,49 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.0.10] - 2026-10-12
+
+### Fixed
+- **Claude sessions piled up inside sandboxes until the host ran out of
+  memory.** `docker exec -it` does not kill the process it started when the
+  client disconnects. After an SSH drop or a closed tab, Claude kept running in
+  the container, invisible, and every later launch started another one beside
+  it. Every launch that starts Claude now stops whatever Claude is already
+  running in the target sandbox, along with its child processes. If no terminal
+  is attached it does this automatically; if one is, it asks first, and without
+  a TTY it refuses. `ls` shows `claude×N` for a sandbox with more than one
+  Claude running.
+- **`resume` did not record which session it resumed.** The state file kept
+  pointing at the session the container was first launched with, so `ls` and
+  idle tracking followed a stale transcript. A session's record now also moves
+  with it when it is resumed in a different sandbox.
+- **Claude processes were matched by any argument containing "claude".** Every
+  path under the container user's home (`/home/claude/...`) matched. Detection
+  now matches the CLI itself.
+
+### Changed
+- **`resume` is session-first.** It lists this checkout's sessions (age, topic,
+  the sandbox each last ran in, whether it is open now), then runs the chosen
+  one in that sandbox. It starts the sandbox if it is stopped and creates one
+  if none exists. `resume --last` brings back the most recent session without
+  the picker; `resume <id-prefix>` resumes a specific one. Previously it
+  picked a container and handed off to Claude's own picker.
+- **Model choice on every launch.** Default, `fable`, `opus`, `sonnet`,
+  `haiku` (Claude Code's aliases, which always mean the newest model in each
+  family) or any model name. With `ANTHROPIC_API_KEY` set on the host, the
+  model IDs that key can use are listed as well. Enter keeps the repo's last
+  choice. `SANDBOX_MODEL` skips the question.
+- **Claude Code updates at most once a day per container**, instead of an
+  `npm install` on every launch. `SANDBOX_UPDATE=1` forces it.
+- Transcript summaries are read from the relevant lines only, instead of
+  parsing whole multi-MB transcripts, so the picker and `ls` are fast.
+
+### Removed
+- **`reap`.** Its idle detection could misjudge a sandbox in active use (see
+  the `resume` fix above), and the session pile-up it worked around is now
+  prevented at launch. Running `./sandbox.sh reap` explains this and points to
+  `stop`.
+
 ## [1.0.9] - 2026-09-16
 
 ### Fixed
