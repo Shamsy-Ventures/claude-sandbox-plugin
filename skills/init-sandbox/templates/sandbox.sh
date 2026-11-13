@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch and manage Claude Code Docker sandboxes
+# Launch and manage Claude Code / opencode Docker sandboxes
 #
 # Session modes:
 #   ./sandbox.sh              - New session in safe mode
@@ -17,20 +17,36 @@
 #   ./sandbox.sh upgrade [--all]   - Refresh sandbox.sh from the installed plugin
 #   ./sandbox.sh version           - Print this script's version
 #
+# Agent (Claude Code or opencode):
+#   Every safe/full/resume launch asks which agent to run (Enter keeps the last
+#   choice). Skip the question with --agent claude|opencode anywhere on the
+#   command line, or SANDBOX_AGENT=claude|opencode. Examples:
+#     ./sandbox.sh full --agent opencode
+#     ./sandbox.sh resume --agent opencode --last
+#   opencode is installed into the sandbox on first use and updated daily like
+#   Claude Code. Its permissions come from .opencode/profiles/{safe,full}.json
+#   (written with defaults when missing). Its login and sessions live on the
+#   host (~/.config/opencode, ~/.local/share/opencode, ~/.local/state/opencode),
+#   mounted into every sandbox created by 1.1.0+. An older sandbox lacks those
+#   mounts; launching opencode there offers to recreate it (code and
+#   transcripts are on the host, only the container layer is discarded).
+#
 # Stopping a sandbox is non-destructive: the repo and ~/.claude are bind-mounted
 # from the host, so code and session transcripts live outside the container.
 # `docker start` (or any launch mode) picks up exactly where you left off.
 #
-# One Claude per sandbox: before launching Claude, any Claude already running in
-# the container is stopped. If its terminal is gone (an SSH drop leaves it
-# running, invisibly), that happens automatically; if a terminal is still
-# attached, you are asked first. Transcripts are on the host, so nothing is lost.
+# One agent per sandbox: before launching Claude or opencode, any Claude or
+# opencode already running in the container is stopped. If its terminal is gone
+# (an SSH drop leaves it running, invisibly), that happens automatically; if a
+# terminal is still attached, you are asked first. Transcripts are on the host,
+# so nothing is lost. To run both agents at once, use two sandboxes.
 #
-# Every Claude launch asks which model to use (Enter keeps the last choice).
-# Set SANDBOX_MODEL=<alias-or-id> to skip the question.
+# Every launch asks which model to use (Enter keeps the last choice, per agent).
+# Set SANDBOX_MODEL=<alias-or-id> (Claude) or SANDBOX_OPENCODE_MODEL=
+# <provider/model> (opencode) to skip the question.
 #
-# Claude Code inside a sandbox is updated at most once a day per container.
-# Set SANDBOX_UPDATE=1 to force an update check now.
+# Claude Code (and opencode, once used) inside a sandbox is updated at most once
+# a day per container. Set SANDBOX_UPDATE=1 to force an update check now.
 #
 # This script upgrades itself: when the installed claude-sandbox plugin has a
 # newer sandbox.sh, it replaces this copy (keeping a .bak) and re-runs your
@@ -42,7 +58,27 @@
 # With no existing container, or when non-interactive, it uses the default
 # <project>-sandbox container.
 
-SANDBOX_SH_VERSION="1.0.11"
+SANDBOX_SH_VERSION="1.1.0"
+
+# --- Agent option: --agent claude|opencode may appear anywhere ---
+# Stripped here so the positional modes below see only their own words, and
+# exported so a self-upgrade re-run (which gets the stripped args) keeps it.
+_args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --agent)
+            [ -n "${2:-}" ] || { echo "--agent needs a value: claude | opencode" >&2; exit 2; }
+            export SANDBOX_AGENT="$2"; shift 2 ;;
+        --agent=*) export SANDBOX_AGENT="${1#*=}"; shift ;;
+        *) _args+=("$1"); shift ;;
+    esac
+done
+set -- "${_args[@]}"
+unset _args
+case "${SANDBOX_AGENT:-}" in
+    ""|claude|opencode) ;;
+    *) echo "Unknown agent: '$SANDBOX_AGENT' (expected claude or opencode)" >&2; exit 2 ;;
+esac
 
 MODE=${1:-"safe"}
 TRUST_MODE=${2:-"full"}
@@ -66,7 +102,8 @@ export SANDBOX_WORKDIR="$SCRIPT_DIR"
 export SANDBOX_CONTAINER_NAME="${PROJECT_NAME}-sandbox"
 
 # Pre-create host dirs that compose mounts, so docker doesn't create them root-owned.
-mkdir -p "$HOME/.config/gh" "$HOME/.claude"
+mkdir -p "$HOME/.config/gh" "$HOME/.claude" \
+    "$HOME/.config/opencode" "$HOME/.local/share/opencode" "$HOME/.local/state/opencode"
 
 # =============================================================================
 # Session-transcript helpers
@@ -138,11 +175,27 @@ container_cwd() {
 }
 
 # Host path of the repo bind-mounted into a container (excludes the shared
-# ~/.claude and ~/.config/gh mounts), used to locate that repo's state file.
+# per-user mounts under /home/claude: ~/.claude, ~/.config/gh and the opencode
+# dirs), used to locate that repo's state file.
 container_repo_dir() {
     docker inspect --format \
-      '{{range .Mounts}}{{if eq .Type "bind"}}{{if and (ne .Destination "/home/claude/.claude") (ne .Destination "/home/claude/.config/gh")}}{{.Source}}
-{{end}}{{end}}{{end}}' "$1" 2>/dev/null | grep -v '^$' | head -1
+      '{{range .Mounts}}{{if eq .Type "bind"}}{{.Destination}}{{"\t"}}{{.Source}}
+{{end}}{{end}}' "$1" 2>/dev/null \
+        | awk -F'\t' '$1 != "" && $1 !~ /^\/home\/claude(\/|$)/ { print $2; exit }'
+}
+
+# Host PIDs of every opencode process inside a container, one per line: the
+# native binary, or node running the npm package's launcher. Child processes of
+# opencode (LSP servers, shells) are not matched; descendants_of reaches them.
+opencode_cli_pids() {
+    docker top "$1" -eo pid,args 2>/dev/null | tail -n +2 | awk '
+        $2 ~ /(^|\/)\.?opencode$/ { print $1; next }
+        $2 ~ /(^|\/)node$/ && $3 ~ /(^|\/)\.?opencode$/ { print $1 }'
+}
+
+# Host PIDs of every agent (Claude or opencode) inside a container.
+live_agent_pids() {
+    { claude_cli_pids "$1"; opencode_cli_pids "$1"; } | sort -un
 }
 
 # The session id sandbox.sh recorded for a container, if any (authoritative).
@@ -350,6 +403,32 @@ maybe_update_claude() {
     fi
 }
 
+# --- Helper: install opencode on first use, then update it at most daily ---
+# Installed at runtime rather than baked into the Dockerfile so existing repos
+# get it from a sandbox.sh upgrade alone. Lives in the container layer, so a
+# recreated container reinstalls it on its first opencode launch.
+maybe_update_opencode() {
+    local container="$1" id stamp dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sandbox" have=1
+    id=$(docker inspect --format '{{.Id}}' "$container" 2>/dev/null | head -c 12)
+    stamp="$dir/opencode-updated-$id"
+    docker exec "$container" sh -c 'command -v opencode' >/dev/null 2>&1 || have=0
+    if [ "$have" = "1" ] && [ "${SANDBOX_UPDATE:-}" != "1" ] && [ -n "$(find "$stamp" -mmin -1440 2>/dev/null)" ]; then
+        echo "opencode: last update check $(age_short "$(stat -c %Y "$stamp")") ago (daily; SANDBOX_UPDATE=1 to force)."
+        return 0
+    fi
+    if [ "$have" = "1" ]; then echo "Updating opencode (daily check)..."
+    else echo "Installing opencode into $container (first use)..."; fi
+    if docker exec -u root "$container" npm install -g --no-fund --no-audit --loglevel=error opencode-ai@latest >/dev/null; then
+        mkdir -p "$dir" && touch "$stamp"
+        echo "opencode: $(docker exec "$container" opencode --version 2>/dev/null | head -1)"
+    elif [ "$have" = "1" ]; then
+        echo "WARNING: opencode update failed (offline?). Continuing with installed version." >&2
+    else
+        echo "Error: could not install opencode in $container (offline?)." >&2
+        exit 1
+    fi
+}
+
 # --- Helpers: one Claude per sandbox ---
 #
 # `docker exec -it` does not kill the process it started when the client goes
@@ -384,19 +463,20 @@ rss_mb() {
     awk '/^VmRSS:/ { printf "%d", $2 / 1024 }' "/proc/$1/status" 2>/dev/null
 }
 
-# Make sure no Claude is running in a container before starting one.
-# Orphans (no terminal attached) are stopped without asking; if a terminal is
-# still attached, the user decides. Exits the script if they decline.
-clear_live_claude() {
+# Make sure no agent (Claude or opencode) is running in a container before
+# starting one: the container's memory limit is sized for one. Orphans (no
+# terminal attached) are stopped without asking; if a terminal is still
+# attached, the user decides. Exits the script if they decline.
+clear_live_agents() {
     local c="$1" pids=() p clients total=0 ok
-    mapfile -t pids < <(claude_cli_pids "$c")
+    mapfile -t pids < <(live_agent_pids "$c")
     [ ${#pids[@]} -eq 0 ] && return 0
     for p in "${pids[@]}"; do total=$(( total + $(rss_mb "$p" || echo 0) )); done
     clients=$(attached_clients "$c")
 
     if [ "$clients" -gt 0 ]; then
         echo ""
-        echo "$c already has ${#pids[@]} Claude process(es) running (~${total} MB),"
+        echo "$c already has ${#pids[@]} agent process(es) ($(running_tool "$c")) running (~${total} MB),"
         echo "and $clients terminal(s) are attached to this container — probably a session"
         echo "you have open elsewhere. Starting here will close it there; its transcript is saved."
         if ! [ -t 0 ]; then
@@ -409,7 +489,7 @@ clear_live_claude() {
             *) echo "Cancelled — switch to the terminal where it is open."; exit 0 ;;
         esac
     else
-        echo "Stopping ${#pids[@]} orphaned Claude process(es) in $c (~${total} MB; terminal gone, transcript saved)."
+        echo "Stopping ${#pids[@]} orphaned agent process(es) in $c (~${total} MB; terminal gone, transcript saved)."
     fi
 
     # Signal Claude and everything it spawned (shells, MCP servers), via the
@@ -421,7 +501,7 @@ clear_live_claude() {
     # `kill` is the shell builtin here: slim images ship no procps.
     docker exec -u root "$c" sh -c 'kill -TERM "$@"' sh "${inner[@]}" 2>/dev/null
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        [ -z "$(claude_cli_pids "$c")" ] && break
+        [ -z "$(live_agent_pids "$c")" ] && break
         sleep 0.5
     done
     docker exec -u root "$c" sh -c 'kill -KILL "$@"' sh "${inner[@]}" 2>/dev/null
@@ -508,6 +588,150 @@ apply_profile() {
     fi
 }
 
+# --- Helper: set one top-level key in the state file ---
+set_state_key() {
+    local base="{}"
+    [ -f "$STATE_FILE" ] && base=$(jq '.' "$STATE_FILE" 2>/dev/null || echo "{}")
+    echo "$base" | jq --arg k "$1" --arg v "$2" '.[$k] = $v' > "$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# --- Helper: choose the agent for a launch (sets AGENT=claude|opencode) ---
+# --agent / SANDBOX_AGENT skip the question; non-interactive keeps the last.
+choose_agent() {
+    local last choice
+    last=$([ -f "$STATE_FILE" ] && jq -r '.last_agent // empty' "$STATE_FILE" 2>/dev/null)
+    last="${last:-claude}"
+    if [ -n "${SANDBOX_AGENT:-}" ]; then
+        AGENT="$SANDBOX_AGENT"
+    elif ! [ -t 0 ]; then
+        AGENT="$last"
+    else
+        echo ""
+        echo "Agent for this session:"
+        echo "  1) claude     Claude Code"
+        echo "  2) opencode   opencode (reads CLAUDE.md and .claude/skills when the repo has no AGENTS.md)"
+        read -rp "Choose [Enter = $last]: " choice
+        case "$choice" in
+            "") AGENT="$last" ;;
+            1|claude|c) AGENT="claude" ;;
+            2|opencode|o) AGENT="opencode" ;;
+            *) echo "Invalid selection." >&2; exit 1 ;;
+        esac
+    fi
+    set_state_key last_agent "$AGENT"
+    echo "Agent: $AGENT"
+}
+
+# --- Helper: choose the model for an opencode launch ---
+# Sets MODEL_ARGS (empty, or --model <provider/model>). opencode names models
+# as provider/model and has no family aliases, so the choice is opencode's own
+# default, a model your ANTHROPIC_API_KEY can use, or one you type.
+choose_opencode_model() {
+    MODEL_ARGS=()
+    local m last choice i ids=()
+    last=$([ -f "$STATE_FILE" ] && jq -r '.last_opencode_model // empty' "$STATE_FILE" 2>/dev/null)
+    last="${last:-default}"
+
+    if [ -n "${SANDBOX_OPENCODE_MODEL:-}" ]; then
+        m="$SANDBOX_OPENCODE_MODEL"
+    elif ! [ -t 0 ]; then
+        m="$last"
+    else
+        if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            mapfile -t ids < <(curl -fsS --max-time 5 "https://api.anthropic.com/v1/models?limit=100" \
+                -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" 2>/dev/null \
+                | jq -r '.data[]? | "anthropic/\(.id)\t\(.display_name)"' 2>/dev/null)
+        fi
+        echo ""
+        echo "Model for this opencode session:"
+        echo "  1) default                     opencode's configured / last-used model"
+        for i in "${!ids[@]}"; do
+            printf "  %d) %-28s %s\n" "$((i + 2))" "${ids[$i]%%$'\t'*}" "${ids[$i]#*$'\t'}"
+        done
+        echo "  o) other — type provider/model (e.g. anthropic/claude-sonnet-5-5)"
+        echo "  (You can still switch inside opencode with /models.)"
+        read -rp "Choose [Enter = $last]: " choice
+        if [ -z "$choice" ]; then
+            m="$last"
+        elif [ "$choice" = "o" ] || [ "$choice" = "O" ]; then
+            read -rp "Model (provider/model): " m
+            m="${m:-$last}"
+        elif [ "$choice" = "1" ]; then
+            m="default"
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 2 ] && [ "$choice" -le $(( ${#ids[@]} + 1 )) ]; then
+            m="${ids[$((choice - 2))]%%$'\t'*}"
+        else
+            m="$choice"
+        fi
+        set_state_key last_opencode_model "$m"
+    fi
+
+    [ -n "$m" ] && [ "$m" != "default" ] && MODEL_ARGS=(--model "$m")
+    echo "Model: $m"
+}
+
+# --- Helper: opencode permission profiles ---
+# Kept beside the Claude profiles' intent: safe mode allows edits plus the same
+# command list as .claude/profiles/safe-mode.json and asks for anything else;
+# full trust allows everything (the container is the isolation boundary).
+# Written only when missing, so a repo's edited profiles are never overwritten.
+ensure_opencode_profiles() {
+    local d="$SCRIPT_DIR/.opencode/profiles"
+    mkdir -p "$d"
+    [ -f "$d/safe.json" ] || cat > "$d/safe.json" <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "edit": "allow",
+    "webfetch": "allow",
+    "bash": {
+      "*": "ask",
+      "python *": "allow",
+      "pip *": "allow",
+      "pytest*": "allow",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git add *": "allow",
+      "git commit *": "allow",
+      "ls*": "allow",
+      "tree*": "allow",
+      "mkdir *": "allow",
+      "npm *": "allow",
+      "node *": "allow",
+      "rm -rf*": "deny",
+      "sudo *": "deny"
+    }
+  }
+}
+JSON
+    [ -f "$d/full.json" ] || cat > "$d/full.json" <<'JSON'
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "edit": "allow",
+    "webfetch": "allow",
+    "bash": "allow"
+  }
+}
+JSON
+}
+
+# Environment for an opencode launch (sets EXEC_ENV). The profile goes in as
+# OPENCODE_CONFIG_CONTENT, which opencode applies on top of the repo's own
+# opencode.json, so a repo config cannot loosen safe mode. Provider keys are
+# passed through by name from the host at launch time, so a key added later
+# needs no container rebuild; unset ones are not passed.
+opencode_exec_env() {
+    local mode="$1" f k
+    ensure_opencode_profiles
+    f="$SCRIPT_DIR/.opencode/profiles/$mode.json"
+    EXEC_ENV=(-e "OPENCODE_CONFIG_CONTENT=$(cat "$f")")
+    for k in ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY GOOGLE_GENERATIVE_AI_API_KEY; do
+        [ -n "${!k:-}" ] && EXEC_ENV+=(-e "$k")
+    done
+}
+
 # --- Helper: bootstrap gh + git inside the container (idempotent, runs on every entry) ---
 # gh auth comes from the mounted ~/.config/gh (or GH_TOKEN); wire it into git so
 # push/pull over https works, enable git-lfs, and carry the host's git identity in.
@@ -533,7 +757,7 @@ bootstrap_container() {
 }
 
 # --- Helper: what interactive tool (if any) is running in a container ---
-# Inspects the container's process args. Echoes claude / codex / shell / "" .
+# Inspects the container's process args. Echoes claude / opencode / codex / shell / "" .
 running_tool() {
     local c="$1"
     docker ps --format '{{.Names}}' | grep -q "^${c}$" || return 0   # not running
@@ -543,6 +767,8 @@ running_tool() {
     args=$(docker top "$c" -eo pid,args 2>/dev/null | tail -n +2 | cut -d' ' -f2-)
     if [ -n "$(claude_cli_pids "$c")" ]; then
         echo "claude"
+    elif [ -n "$(opencode_cli_pids "$c")" ]; then
+        echo "opencode"
     elif echo "$args" | grep -qiE '(^|/| )codex( |$)|codex'; then
         echo "codex"
     elif echo "$args" | grep -qE '(^|/)(ba)?sh( |$)'; then
@@ -566,6 +792,7 @@ describe_container() {
     tool=$(running_tool "$c")
     case "$tool" in
         claude) out="running claude"; [ -n "$repo_summary" ] && out="$out ~\"$repo_summary\"" ;;
+        opencode) out="running opencode" ;;
         codex)  out="running codex" ;;
         shell)  out="shell open" ;;
         *)      out="idle" ;;
@@ -704,11 +931,11 @@ render_table() {
 
     printf "\n"
     if [ "$numbered" = "--number" ]; then
-        printf "  %-3s %-34s %-16s %-7s %-9s %-40s %s\n" "#" "CONTAINER" "STATUS" "TOOL" "SESSION" "TOPIC" "IDLE"
-        printf "  %-3s %-34s %-16s %-7s %-9s %-40s %s\n" "---" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..16})" "-------" "---------" "$(printf '%.0s-' {1..40})" "----"
+        printf "  %-3s %-34s %-16s %-9s %-9s %-40s %s\n" "#" "CONTAINER" "STATUS" "TOOL" "SESSION" "TOPIC" "IDLE"
+        printf "  %-3s %-34s %-16s %-9s %-9s %-40s %s\n" "---" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..16})" "---------" "---------" "$(printf '%.0s-' {1..40})" "----"
     else
-        printf "  %-34s %-16s %-7s %-9s %-40s %s\n" "CONTAINER" "STATUS" "TOOL" "SESSION" "TOPIC" "IDLE"
-        printf "  %-34s %-16s %-7s %-9s %-40s %s\n" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..16})" "-------" "---------" "$(printf '%.0s-' {1..40})" "----"
+        printf "  %-34s %-16s %-9s %-9s %-40s %s\n" "CONTAINER" "STATUS" "TOOL" "SESSION" "TOPIC" "IDLE"
+        printf "  %-34s %-16s %-9s %-9s %-40s %s\n" "$(printf '%.0s-' {1..34})" "$(printf '%.0s-' {1..16})" "---------" "---------" "$(printf '%.0s-' {1..40})" "----"
     fi
 
     local ambiguous=0 stacked=0
@@ -743,15 +970,16 @@ render_table() {
         [ -z "$topic" ] && topic="-"
 
         if [ "$numbered" = "--number" ]; then
-            printf "  %-3s %-34s %-16s %-7s %-9s %-40s %s\n" \
+            printf "  %-3s %-34s %-16s %-9s %-9s %-40s %s\n" \
                 "$((i+1))" "$n" "${st:0:16}" "$tool" "$sid_disp" "${topic:0:40}" "$idle"
         else
-            printf "  %-34s %-16s %-7s %-9s %-40s %s\n" \
+            printf "  %-34s %-16s %-9s %-9s %-40s %s\n" \
                 "$n" "${st:0:16}" "$tool" "$sid_disp" "${topic:0:40}" "$idle"
         fi
     done
     printf "\n"
     printf "  SESSION: Claude session id — bare = recorded at launch, ~ = inferred\n"
+    printf "           (opencode sessions are not tracked here; use /sessions inside opencode)\n"
     printf "  IDLE   : time since this session's transcript was last written\n"
     if [ "$stacked" = "1" ]; then
         printf "  claude×N — several Claudes in one sandbox, left behind by dropped\n"
@@ -836,13 +1064,13 @@ cmd_stop() {
             [ -n "$sid" ] && printf "  session %s" "${sid:0:8}"
             [ -n "$summ" ] && printf "  \"%s\"" "$summ"
         fi
-        if [ "$tool" = "claude" ]; then printf "   [LIVE claude — will be interrupted]"; live=1; fi
+        case "$tool" in claude|opencode) printf "   [LIVE %s — will be interrupted]" "$tool"; live=1 ;; esac
         printf "\n"
     done <<< "$picks"
     echo ""
     if [ "$live" = "1" ]; then
-        echo "One or more have a live Claude session. The transcript is already on the host,"
-        echo "so you can pick it back up with:  ./sandbox.sh resume   (or  claude --resume <id>)"
+        echo "One or more have a live agent session. The transcript is already on the host,"
+        echo "so you can pick it back up with:  ./sandbox.sh resume [--agent opencode]"
         echo ""
     fi
 
@@ -1044,24 +1272,91 @@ YAML
             ;;
     esac
 
+    # Shared per-user opencode state (login, sessions, recents). Added as a
+    # runtime override rather than in docker-compose.sandbox.yml because that
+    # file is generated once per repo and never upgraded; this way every repo
+    # gets the mounts from a sandbox.sh upgrade alone. Written outside the repo
+    # so it needs no .gitignore entry. Every new sandbox gets them, so it can
+    # switch between Claude and opencode without a rebuild.
+    local agents_override="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sandbox/${proj}.agents.override.yml"
+    mkdir -p "$(dirname "$agents_override")"
+    cat > "$agents_override" <<YAML
+services:
+  claude-sandbox:
+    volumes:
+      - $HOME/.config/opencode:/home/claude/.config/opencode
+      - $HOME/.local/share/opencode:/home/claude/.local/share/opencode
+      - $HOME/.local/state/opencode:/home/claude/.local/state/opencode
+YAML
+    compose_args+=(-f "$agents_override")
+
     docker compose -p "$proj" "${compose_args[@]}" build
     docker compose -p "$proj" "${compose_args[@]}" up -d claude-sandbox
     record_container "$name" "$desc"
 }
 
+# Does a container have the opencode state mounts (created by 1.1.0+)?
+has_opencode_mounts() {
+    docker inspect --format '{{range .Mounts}}{{.Destination}}
+{{end}}' "$1" 2>/dev/null | grep -qx '/home/claude/.local/share/opencode'
+}
+
+# A sandbox created before 1.1.0 cannot run opencode with shared login and
+# sessions: Docker cannot add mounts to an existing container. Offer to
+# recreate it under the same name and description. Returns 1 if declined.
+offer_opencode_recreate() {
+    local c="$1" ok
+    echo ""
+    echo "$c was created before opencode support, so it lacks the mounts that share"
+    echo "opencode's login and sessions with the host (Docker cannot add mounts to an"
+    echo "existing container). Recreating it keeps the repo and all Claude/opencode"
+    echo "transcripts (they are on the host); only the container layer is discarded."
+    if ! [ -t 0 ]; then
+        echo "Recreate it with:  docker rm -f $c   then rerun this command." >&2
+        return 1
+    fi
+    if [ -n "$(live_agent_pids "$c")" ]; then
+        echo "WARNING: an agent is running in $c right now and will be stopped."
+    fi
+    read -rp "Recreate $c now? [y/N]: " ok
+    case "$ok" in
+        y|Y|yes|YES) docker rm -f "$c" >/dev/null && echo "Removed $c." ;;
+        *) echo "Cancelled. Use claude here, or pick/create another sandbox for opencode."; return 1 ;;
+    esac
+}
+
+# Forget the Claude session recorded for a container (it now runs something
+# else), so ls/resume do not report a stale Claude session there.
+clear_session() {
+    [ -f "$STATE_FILE" ] || return 0
+    write_containers "$(jq --arg n "$1" '[.containers[]? | if .name == $n then del(.session_id, .session_started_at) else . end]' "$STATE_FILE" 2>/dev/null || echo '[]')"
+}
+
 # Bring a container up and run a command in it: create or start it, stop any
-# Claude already running there (when launching Claude), update Claude Code if
-# it has not been checked today, record the session, then attach.
+# agent already running there (when launching an agent), install/update the
+# agent if it has not been checked today, record the session, then attach.
+# EXEC_ENV (array of docker exec -e args) is passed through when set.
 # Args: <container> <create:0|1> <description> <session-id|""> <command...>
 launch() {
     local c="$1" create="$2" desc="$3" sid="$4"; shift 4
+    if [ "$create" != "1" ] && [ "$1" = "opencode" ] && ! has_opencode_mounts "$c"; then
+        [ -z "$desc" ] && [ -f "$STATE_FILE" ] && \
+            desc=$(jq -r --arg n "$c" '.containers[]? | select(.name==$n) | .description // empty' "$STATE_FILE" 2>/dev/null)
+        offer_opencode_recreate "$c" || exit 1
+        create=1
+    fi
     if [ "$create" = "1" ]; then create_container "$c" "$desc"; else ensure_running "$c"; fi
-    [ "$1" = "claude" ] && clear_live_claude "$c"
-    maybe_update_claude "$c"
+    case "$1" in claude|opencode) clear_live_agents "$c" ;; esac
+    if [ "$1" = "opencode" ]; then
+        maybe_update_opencode "$c"
+        clear_session "$c"
+    else
+        maybe_update_claude "$c"
+        record_session "$c" "$sid"
+    fi
     bootstrap_container "$c"
-    record_session "$c" "$sid"
     echo "Attaching to container: $c"
-    docker exec -it "$c" "$@"
+    docker exec -it "${EXEC_ENV[@]}" "$c" "$@"
 }
 
 # Where a session was last run, for the picker: "open in <c>", "in <c>", or "".
@@ -1205,9 +1500,13 @@ case "$MODE" in
         exit 2 ;;
 esac
 
+EXEC_ENV=()
+AGENT="claude"
+[ "$MODE" != "shell" ] && choose_agent
+
 # --- Resume mode ---
 # Session first: pick the conversation, then it runs in the sandbox it last ran
-# in (started or created as needed), with any Claude already there stopped.
+# in (started or created as needed), with any agent already there stopped.
 if [ "$MODE" = "resume" ]; then
     shift
     TRUST_MODE="full"; WANT_LAST=0; WANT_ID=""
@@ -1219,6 +1518,27 @@ if [ "$MODE" = "resume" ]; then
             *) WANT_ID="$a" ;;
         esac
     done
+
+    if [ "$AGENT" = "opencode" ]; then
+        # opencode keeps its own session store (shared with the host through the
+        # mounted ~/.local/share/opencode) and its own picker, so: an id resumes
+        # that session, --last continues the most recent one, and otherwise
+        # opencode opens with its session list a /sessions away.
+        OC_CMD=(opencode)
+        if [ -n "$WANT_ID" ]; then
+            OC_CMD+=(--session "$WANT_ID")
+        elif [ "$WANT_LAST" = "1" ] || ! [ -t 0 ]; then
+            OC_CMD+=(--continue)
+        else
+            echo "opencode: pick the session to resume with /sessions once it opens."
+        fi
+        resolve_container ""
+        choose_opencode_model
+        echo "Resuming opencode in $TRUST_MODE mode..."
+        opencode_exec_env "$TRUST_MODE"
+        launch "$TARGET" "$TARGET_CREATE" "$TARGET_DESC" "" "${OC_CMD[@]}" "${MODEL_ARGS[@]}"
+        exit $?
+    fi
 
     SDIR=$(session_dir_for "$SANDBOX_WORKDIR") || SDIR=""
     SID=""
@@ -1265,7 +1585,16 @@ fi
 # New sessions get an explicit --session-id so `ls`/`stop`/`resume` can tell
 # which session a container is running as a recorded fact, not an inference.
 NEW_SESSION_ID=""
-if [ "$MODE" = "full" ]; then
+if [ "$AGENT" = "opencode" ] && [ "$MODE" != "shell" ]; then
+    if [ "$MODE" = "full" ]; then
+        echo "WARNING: Running opencode in full trust mode - all commands allowed"
+        opencode_exec_env "full"
+    else
+        echo "Running opencode in safe mode with restricted permissions"
+        opencode_exec_env "safe"
+    fi
+    CLAUDE_CMD=(opencode)
+elif [ "$MODE" = "full" ]; then
     echo "WARNING: Running in full trust mode - all commands allowed"
     NEW_SESSION_ID=$(new_uuid)
     CLAUDE_CMD=(claude --dangerously-skip-permissions)
@@ -1310,7 +1639,7 @@ else
 fi
 
 if [ "$MODE" != "shell" ]; then
-    choose_model
+    if [ "$AGENT" = "opencode" ]; then choose_opencode_model; else choose_model; fi
     CLAUDE_CMD+=("${MODEL_ARGS[@]}")
 fi
 

@@ -4,6 +4,47 @@ All notable changes to this plugin are documented here. Versions follow the
 `version` field in `.claude-plugin/plugin.json`, and each release is tagged
 (`vX.Y.Z`) so it can be pinned.
 
+## [1.1.0] - 2026-11-13
+
+### Added
+- **opencode alongside Claude Code.** Every safe/full/resume launch asks which
+  agent to run, Claude Code or opencode (Enter keeps the last choice per repo;
+  `--agent claude|opencode` anywhere on the command line, or `SANDBOX_AGENT`,
+  skips the question). Everything opencode needs is delivered by `sandbox.sh`
+  itself, so existing repos get it from the automatic upgrade, with no
+  Dockerfile, compose or profile regeneration:
+  - opencode is installed into the container on its first launch there
+    (`npm install -g opencode-ai`) and updated daily like Claude Code.
+  - New sandboxes mount `~/.config/opencode`, `~/.local/share/opencode` and
+    `~/.local/state/opencode` from the host, through a compose override written
+    to `~/.cache/claude-sandbox/` at creation, so opencode's login and sessions
+    are shared between host and sandboxes the way `~/.claude` is.
+  - Permissions come from `.opencode/profiles/{safe,full}.json`, written with
+    defaults matching the Claude safe profile when missing, and applied as
+    `OPENCODE_CONFIG_CONTENT` so a repo's own `opencode.json` cannot loosen
+    safe mode.
+  - Provider keys (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
+    `GOOGLE_GENERATIVE_AI_API_KEY`) set on the host are passed in at launch.
+  - The model picker offers opencode's default, the `anthropic/<id>` models the
+    API key can use, or a typed `provider/model`; remembered separately from
+    the Claude choice. `SANDBOX_OPENCODE_MODEL` skips it.
+  - `resume --agent opencode` runs `opencode --session <id>`, `--continue`
+    (with `--last`), or opens opencode's own `/sessions` picker.
+
+### Changed
+- **One agent per sandbox** (was one Claude). Launching either agent stops any
+  Claude or opencode already running in the target sandbox, with the same
+  orphan-vs-attached rules as 1.0.10. `ls` shows `opencode` in the TOOL column.
+- **Sandboxes created before 1.1.0** lack the opencode mounts, and Docker
+  cannot add mounts to an existing container. Launching opencode in one offers
+  to recreate it under the same name and description; without a TTY it prints
+  the `docker rm -f` command instead. Claude keeps working in them unchanged.
+
+### Fixed
+- `container_repo_dir` (used by `ls` to find a sandbox's state file) now skips
+  every per-user mount under `/home/claude`, not just `~/.claude` and
+  `~/.config/gh`, so the new opencode mounts are never mistaken for the repo.
+
 ## [1.0.11] - 2026-10-12
 
 ### Added

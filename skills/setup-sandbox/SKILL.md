@@ -23,6 +23,7 @@ For most projects, just run `/init-sandbox` which will create all files automati
 | `.dockerignore` | Excludes .env from image build |
 | `.claude/profiles/safe-mode.json` | Restricted permissions (recommended) |
 | `.claude/profiles/full-trust.json` | Unrestricted permissions |
+| `.opencode/profiles/{safe,full}.json` | opencode permissions (written by `sandbox.sh` when missing) |
 | `.claude-plugins/` | Plugin configuration (ralph-loop pre-enabled) |
 
 ## Usage Modes
@@ -97,7 +98,29 @@ After a crash or reboot, `./sandbox.sh ls --all` shows each sandbox's last sessi
 
 Containers created before 1.0.3 run at `/workspace` and cannot see this checkout's transcripts, so resume skips them and says so. Their old sessions are still reachable from inside: `./sandbox.sh shell`, then `claude --resume`.
 
-## One Claude per sandbox
+## opencode alongside Claude Code
+
+Every sandbox can run either [opencode](https://opencode.ai) or Claude Code, one at a time. Launches ask which agent to run:
+
+```
+Agent for this session:
+  1) claude     Claude Code
+  2) opencode   opencode (reads CLAUDE.md and .claude/skills when the repo has no AGENTS.md)
+Choose [Enter = claude]:
+```
+
+- Enter keeps the last choice (per repo, in `.sandbox-state.json`). `--agent claude|opencode` anywhere on the command line, or `SANDBOX_AGENT`, skips the question: `./sandbox.sh full --agent opencode`, `./sandbox.sh resume --agent opencode --last`.
+- **Nothing to regenerate.** Everything opencode needs is delivered by `sandbox.sh`, so an existing repo gets it from the automatic `sandbox.sh` upgrade alone:
+  - opencode is installed into the container (`npm install -g opencode-ai`) on its first launch there, then updated daily like Claude Code (`SANDBOX_UPDATE=1` forces it).
+  - Its login and sessions live on the host in `~/.config/opencode`, `~/.local/share/opencode` and `~/.local/state/opencode`, mounted into each sandbox through a compose override that `sandbox.sh` writes at creation (in `~/.cache/claude-sandbox/`, outside the repo). Log in once with `opencode auth login` (on the host or in any sandbox), or set a provider key on the host (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`); set keys are passed in at each launch, so adding one needs no rebuild.
+  - Permissions come from `.opencode/profiles/safe.json` and `full.json`, written with defaults when missing (commit them like `.claude/profiles/`). Safe allows edits, web fetch and the same command list as the Claude safe profile, asks for any other command, and denies `rm -rf` and `sudo`. Full allows everything. The profile is passed as `OPENCODE_CONFIG_CONTENT`, which overrides the repo's own `opencode.json`, so a repo config cannot loosen safe mode.
+- **Sandboxes created before 1.1.0** lack the opencode mounts, and Docker cannot add mounts to an existing container. Launching opencode in one offers to recreate it under the same name and description (`docker rm -f` + create). The repo and every transcript are on the host, so only the container layer is lost. Claude keeps working in old sandboxes without recreating them.
+- **Model:** opencode names models `provider/model` and has no family aliases. The picker offers opencode's own default, the models your `ANTHROPIC_API_KEY` can use (as `anthropic/<id>`), or one you type. Enter keeps the last opencode choice, which is remembered separately from Claude's. `SANDBOX_OPENCODE_MODEL` skips the question.
+- **Resume:** opencode keeps its own session store and picker, so `resume --agent opencode` with an id runs `opencode --session <id>`, with `--last` runs `opencode --continue`, and otherwise opens opencode to pick from `/sessions`. `ls` shows `opencode` in the TOOL column but does not track opencode session ids.
+- **Project instructions:** opencode reads `AGENTS.md`, and falls back to `CLAUDE.md` when a repo has none. It also loads skills from `.claude/skills/`. So a repo that keeps its rules in `CLAUDE.md` and its workflows as skills there serves both agents from one copy. Adding an `AGENTS.md` makes opencode ignore `CLAUDE.md`.
+- **Not carried over:** Claude Code plugins (ralph-loop), `CLAUDE_CODE_*` settings in the Claude profiles, and Claude's built-in slash commands.
+
+## One agent per sandbox
 
 `docker exec -it` does not kill the process it started when the client goes away. After an SSH drop or a closed terminal tab, Claude keeps running inside the container, using memory, with nothing on screen to show it. Before 1.0.10 every later launch started another Claude beside it, and a host could build up a dozen invisible sessions and run out of memory.
 
@@ -107,6 +130,8 @@ Every launch that starts Claude (default/`full`/`resume`) now checks the target 
 - **A terminal is still attached** (the session is probably open in another window): you are asked before it is stopped. Without a TTY the script refuses instead.
 
 The transcript is on the host either way, so a stopped session can always be resumed. `shell` mode does not stop anything. `ls` shows `claude×N` when a sandbox has more than one Claude running.
+
+Since 1.1.0 the rule covers opencode too: launching either agent stops any Claude or opencode already running in that sandbox, because the container's memory limit is sized for one. To run both at once, use two sandboxes.
 
 ## Model choice
 
@@ -355,6 +380,8 @@ Set your API key before running:
 ```bash
 export ANTHROPIC_API_KEY=your-key-here
 ```
+
+For opencode, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY` are passed through at launch when set on the host, or log in once with `opencode auth login`.
 
 Add any other environment variables your project needs to `docker-compose.sandbox.yml` under the `environment` section.
 
